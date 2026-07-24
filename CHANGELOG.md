@@ -6,6 +6,19 @@
   Braid live tracking on simulated cameras and reports end-to-end latency
   percentiles from both the model-server event stream and the recorded
   `.braidz`. Baseline on an idle machine: ~1 ms typical, <4 ms worst case.
+* Added the packaged `ffmpeg-rewriter-doctor` command, which finishes MP4
+  recordings whose timestamp-embedding rewrite was interrupted by a crash. Such
+  a recording is left with its capture times only in the temporary
+  `-ffmpeg-rewriter.srt` sidecar (and possibly a partial
+  `.mp4-rewritten.mp4`); `check` reports them and `fix` embeds the timestamps
+  and metadata into the MP4 as closing the recording normally would have. The
+  group of pictures in progress at the moment of the crash has no recorded
+  timing and is dropped; how many frames were kept is reported. Recordings whose
+  MP4 ffmpeg itself never finalized, including those still being written, are
+  reported and left untouched.
+
+  The same repair is available as `ffmpeg_rewriter::{inspect, repair,
+  find_interrupted}`.
 * Added the packaged `mp4-misp-inserter` command, which embeds per-frame
   `MISPmicrosectime` timestamps from a companion `.srt` file into an existing
   H.264 MP4 without decoding or re-encoding it. Original sample timing,
@@ -28,6 +41,15 @@
   after a disk-full error is resolved).
 * Malformed `.srt` sidecars now produce an error with the file path and
   approximate line number instead of panicking during parsing.
+* Closing an ffmpeg-based MP4 recording now fails loudly if the capture times it
+  logged do not cover every encoded frame, instead of silently renaming a
+  frame-short rewrite over the complete recording. The original video and its
+  sidecars are left in place, so `ffmpeg-rewriter-doctor` can finish the job.
+* An `.srt` timing sidecar cut off mid-entry — as a process killed while writing
+  one leaves it — no longer panics when read. Such an entry has no usable
+  timestamp, so it and everything after it are now treated as timing the file
+  does not have, which is reported as a truncation (with the line it starts on)
+  in the same way as an `.srt` that simply ends early.
 * `strand-cam-bui-types` now enables serde's standard-library support itself,
   fixing builds of downstream projects that consume the crate from source.
 * The Ubuntu installer zip's README now substitutes the actual generated `.deb`
