@@ -108,6 +108,7 @@ runs:
           -p braidz-cli \
           -p strand-convert \
           -p show-timestamps \
+          -p ffmpeg-rewriter-doctor \
           -p mp4-bframe-doctor \
           -p mp4-misp-inserter \
           -p write-debian-changelog \
@@ -137,7 +138,8 @@ runs:
           flytrax-csv-to-braidz braidz-mcsc fmf gocal cal-to-xml \
           align-calibration braid-april-cal-cli braidz-export-rrd \
           rerun-braidz-viewer braidz-cli strand-convert show-timestamps \
-          mp4-bframe-doctor mp4-misp-inserter write-debian-changelog; do
+          ffmpeg-rewriter-doctor mp4-bframe-doctor mp4-misp-inserter \
+          write-debian-changelog; do
           cp "target/release/$bin" build/
         done
         # The flydratrax GUI binary is renamed during packaging.
