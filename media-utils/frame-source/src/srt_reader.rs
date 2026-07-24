@@ -57,6 +57,10 @@ pub struct Stanza {
     pub(crate) _start: std::time::Duration,
     pub(crate) _stop: std::time::Duration,
     pub(crate) lines: String,
+    /// 1-based line in the source file where this stanza starts, so a caller
+    /// rejecting a stanza (e.g. because its payload is not the JSON it
+    /// expected) can point at the offending line.
+    pub(crate) start_line: usize,
 }
 
 impl Stanza {
@@ -101,6 +105,8 @@ fn parse_stanza(input: &mut &BStr) -> ModalResult<Stanza> {
             _start: start,
             _stop: stop,
             lines,
+            // Filled in by `parse_stanzas`, which tracks the position in the file.
+            start_line: 0,
         })
     })
     .parse_next(input)
@@ -112,15 +118,23 @@ fn parse_stanza(input: &mut &BStr) -> ModalResult<Stanza> {
 /// checking if `input` still has bytes left afterwards.
 fn parse_stanzas(input: &mut &BStr) -> Vec<Stanza> {
     let mut result = vec![];
+    // 1-based line of the next stanza, advanced by the newlines each stanza (and
+    // each inter-stanza separator) consumes.
+    let mut line = 1usize;
     loop {
         match opt(eof::<_, ContextError>).parse_next(input) {
             Ok(Some(_)) | Err(_) => break,
             Ok(None) => {}
         }
+        let before = *input;
         match parse_stanza.parse_next(input) {
-            Ok(x) => result.push(x),
+            Ok(mut x) => {
+                x.start_line = line;
+                result.push(x);
+            }
             Err(_) => break,
         }
+        line += newlines_consumed(before, input);
         match opt(eof::<_, ContextError>).parse_next(input) {
             Ok(Some(_)) | Err(_) => break,
             Ok(None) => {}
@@ -128,8 +142,17 @@ fn parse_stanzas(input: &mut &BStr) -> Vec<Stanza> {
         if line_ending::<_, ContextError>.parse_next(input).is_err() {
             break;
         }
+        // The blank line separating stanzas.
+        line += 1;
     }
     result
+}
+
+/// How many newlines the parser consumed advancing from `before` to `after`
+/// (`after` is a suffix of `before`).
+fn newlines_consumed(before: &BStr, after: &&BStr) -> usize {
+    let consumed = &before[..before.len() - after.len()];
+    consumed.iter().filter(|&&b| b == b'\n').count()
 }
 
 /// Result of parsing an SRT file: whatever stanzas parsed cleanly, plus the
@@ -215,6 +238,19 @@ mod test {
 00:00:00,080 --> 00:00:00,120
 {"frame_cnt":3,"timestamp":"2024-11-21T21:04:19.563575+01:00"}
 "#;
+
+    /// Each stanza records the line it starts on, so a caller that rejects a
+    /// stanza's payload can say where in the file the trouble starts. With the
+    /// 3-line stanzas written by `srt-writer` plus one blank separator line,
+    /// stanza *n* starts at line `4n + 1`.
+    #[test]
+    fn test_stanza_start_lines() {
+        for in_b in [B3A, B3B] {
+            let stanzas = parse_stanzas(&mut in_b.into());
+            let start_lines: Vec<usize> = stanzas.iter().map(|s| s.start_line).collect();
+            assert_eq!(start_lines, vec![1, 5, 9]);
+        }
+    }
 
     #[test]
     fn test_parse() {

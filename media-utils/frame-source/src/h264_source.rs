@@ -66,6 +66,10 @@ struct SrtMsg {
 }
 
 impl SrtData {
+    /// The capture time carried in a stanza's JSON payload.
+    ///
+    /// Only stanzas whose payload already parsed cleanly are retained when the
+    /// [`SrtData`] is built, so this cannot fail for them.
     fn parse_time(stanza: &Stanza) -> DateTime<FixedOffset> {
         let msg: SrtMsg = serde_json::from_str(&stanza.lines).unwrap();
         msg.timestamp
@@ -489,18 +493,38 @@ where
 
         let mut srt_data = if let Some(srt_file_path) = srt_file_path {
             let outcome = srt_reader::read_srt_file(&srt_file_path)?;
-            if outcome.stanzas.is_empty() {
+            let mut stanzas = outcome.stanzas;
+            let mut truncated_at_line = outcome.truncated_at_line;
+
+            // Keep only the leading stanzas whose payload is the JSON we expect.
+            // A writer killed mid-stanza leaves a final stanza whose payload is a
+            // half-written JSON object: SubRip-wise it parses (it is simply the
+            // last thing in the file), but its timestamp cannot be read, so treat
+            // it -- and anything after it -- as unusable rather than unwrapping a
+            // JSON error later. This also makes [`SrtData::parse_time`]'s unwrap
+            // safe: every retained stanza has been parsed successfully here.
+            if let Some(bad) = stanzas
+                .iter()
+                .position(|stanza| serde_json::from_str::<SrtMsg>(&stanza.lines).is_err())
+            {
+                // A malformed payload always precedes wherever the SubRip parse
+                // itself gave up, so this is the earlier (governing) stop point.
+                truncated_at_line = Some(stanzas[bad].start_line);
+                stanzas.truncate(bad);
+            }
+
+            if stanzas.is_empty() {
                 return Err(Error::SrtParseError {
                     path: srt_file_path,
-                    line: outcome.truncated_at_line.unwrap_or(1),
+                    line: truncated_at_line.unwrap_or(1),
                 });
             }
-            let frame0_time = SrtData::parse_time(&outcome.stanzas[0]);
+            let frame0_time = SrtData::parse_time(&stanzas[0]);
             Some(SrtData {
-                stanzas: outcome.stanzas,
+                stanzas,
                 idx: 0,
                 frame0_time,
-                truncated_at_line: outcome.truncated_at_line,
+                truncated_at_line,
             })
         } else {
             None
