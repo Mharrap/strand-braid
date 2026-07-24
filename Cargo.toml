@@ -81,6 +81,7 @@ members = [
     "media-utils/dump-frame",
     "media-utils/ffmpeg-writer",
     "media-utils/ffmpeg-rewriter",
+    "media-utils/ffmpeg-rewriter-doctor",
     "media-utils/fmf",
     "media-utils/fmf/fmf-cli",
     "media-utils/font-drawing",

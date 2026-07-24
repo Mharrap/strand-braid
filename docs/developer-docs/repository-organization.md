@@ -82,6 +82,7 @@
  - dynlink-cuda (media-utils/nvenc/dynlink-cuda) - dynamic linking for the NVIDIA CUDA runtime library
  - dynlink-nvidia-encode (media-utils/nvenc/dynlink-nvidia-encode) - dynamic linking for the NVIDIA Video Codec SDK (NVENC)
  - ffmpeg-rewriter (media-utils/ffmpeg-rewriter) - save MP4 video by piping frames through ffmpeg and rewriting with metadata upon file close
+ - ffmpeg-rewriter-doctor (media-utils/ffmpeg-rewriter-doctor) - finish MP4 recordings whose timestamp-embedding rewrite was interrupted by a crash
  - ffmpeg-writer (media-utils/ffmpeg-writer) - write video by piping raw frames through ffmpeg
  - fmf (media-utils/fmf) - read and write .fmf (Fly Movie Format) video files
  - fmf-cli (media-utils/fmf/fmf-cli) - work with .fmf (fly movie format) files

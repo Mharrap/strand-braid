@@ -1,0 +1,14 @@
+[package]
+name = "ffmpeg-rewriter-doctor"
+version.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "finish MP4 recordings whose timestamp-embedding rewrite was interrupted by a crash"
+
+[dependencies]
+clap.workspace = true
+eyre.workspace = true
+camino.workspace = true
+
+ffmpeg-rewriter.workspace = true
+env-tracing-logger.workspace = true
