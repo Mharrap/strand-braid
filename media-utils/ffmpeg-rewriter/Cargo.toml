@@ -29,6 +29,9 @@ env-tracing-logger.workspace = true
 eyre.workspace = true
 font-drawing.workspace = true
 image.workspace = true
+# Tests read container boxes that `frame-source` does not surface, notably the
+# edit list (`elst`).
+mp4.workspace = true
 tempfile.workspace = true
 test-log = { workspace = true, features = [
     "trace",

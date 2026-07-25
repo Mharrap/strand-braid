@@ -1303,6 +1303,89 @@ mod test {
         check_skipped_frame_gap(Reorder::InOrder)
     }
 
+    /// A reordered recording must carry an edit list (`elst`) trimming its
+    /// reorder lead-in, so playback starts on the first captured frame rather
+    /// than a few frames of nothing.
+    ///
+    /// The lead-in itself is unavoidable and stays in the media timeline (see
+    /// [`test_presentation_start_offset_is_a_bounded_lead_in`]); the edit list is
+    /// what hides it. `media_time` must therefore equal the lead-in exactly, and
+    /// an in-order recording -- which has no lead-in -- must get no edit list at
+    /// all rather than a vacuous one.
+    #[test]
+    fn test_reorder_lead_in_is_trimmed_by_an_edit_list() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let timestamps = exact_cadence(TIMING_TEST_FRAMES, FRAME_INTERVAL_US);
+
+        for reorder in [Reorder::Reordered, Reorder::InOrder] {
+            let mp4_fname = tempdir.path().join(format!("{reorder:?}.mp4"));
+            record_recording(&mp4_fname, &timestamps, reorder)?;
+
+            let samples = read_presentation_order(&mp4_fname, reorder)?;
+            let lead_in_us = samples[0].pts.num_microseconds().unwrap();
+            let entries = read_edit_list(&mp4_fname)?;
+
+            match reorder {
+                Reorder::InOrder => {
+                    assert_eq!(lead_in_us, 0, "an in-order stream has no lead-in");
+                    assert!(
+                        entries.is_empty(),
+                        "an in-order recording needs no edit list, got {entries:?}"
+                    );
+                }
+                Reorder::Reordered => {
+                    assert!(lead_in_us > 0, "expected a reorder lead-in to trim");
+                    assert_eq!(entries.len(), 1, "expected one edit, got {entries:?}");
+                    let (media_time_us, segment_duration_us) = entries[0];
+                    assert_interval_near(media_time_us, lead_in_us, 0, "edit list media_time");
+                    // Every sample is shown for its own duration, so the
+                    // presentation timeline is as long as the media timeline.
+                    let media_us = (samples.last().unwrap().pts - samples[0].pts)
+                        .num_microseconds()
+                        .unwrap()
+                        + FRAME_INTERVAL_US;
+                    assert_interval_near(
+                        segment_duration_us,
+                        media_us,
+                        0,
+                        "edit list segment_duration",
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// A recording's edit list as `(media_time, segment_duration)` pairs in
+    /// microseconds. Empty when the file has no `elst`.
+    fn read_edit_list(mp4_fname: &Path) -> Result<Vec<(i64, i64)>> {
+        let rdr = std::fs::File::open(mp4_fname)?;
+        let size = rdr.metadata()?.len();
+        let mp4 = mp4::Mp4Reader::read_header(std::io::BufReader::new(rdr), size)
+            .map_err(frame_source::Error::from)?;
+        let movie_timescale = mp4.timescale() as i64;
+        let track = mp4.tracks().values().next().expect("a video track");
+        let media_timescale = track.timescale() as i64;
+        let Some(elst) = track.trak.edts.as_ref().and_then(|edts| edts.elst.as_ref()) else {
+            return Ok(Vec::new());
+        };
+        Ok(elst
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    // `media_time` is in the *media* timescale while
+                    // `segment_duration` is in the *movie* timescale. They happen
+                    // to be equal in what `mp4-writer` emits, but converting each
+                    // with its own keeps this test honest if that changes.
+                    e.media_time * 1_000_000 / media_timescale,
+                    (e.segment_duration as i64) * 1_000_000 / movie_timescale,
+                )
+            })
+            .collect())
+    }
+
     /// I3 (and I2): jitter in the recorded capture *timestamps* must not reach
     /// the container. The acquisition clock is more regular than the timestamps
     /// we manage to record against it, so the container should carry the best

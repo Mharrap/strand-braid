@@ -689,9 +689,36 @@ where
                     MyEncoder::NoNvidia(_) => None,
                 };
 
+                // Read after the flush above, so the final frame is counted.
+                let edit_list_trim = match &state.my_encoder {
+                    MyEncoder::CopyRawH264 { h264_parser } => h264_parser.edit_list_trim(),
+                    MyEncoder::LessH264(wrapper) => wrapper.h264_parser.edit_list_trim(),
+                    #[cfg(feature = "openh264")]
+                    MyEncoder::OpenH264(encoder) => encoder.h264_parser.edit_list_trim(),
+                    #[cfg(feature = "nv-encode")]
+                    MyEncoder::Nvidia(nv_encoder) => nv_encoder.h264_parser.edit_list_trim(),
+                    #[cfg(not(feature = "nv-encode"))]
+                    MyEncoder::NoNvidia(_) => None,
+                };
+
                 if let MaybeMp4Writer::Mp4Writer(mut mp4_writer) = state.mp4_segment {
                     if let Some(final_sample) = final_sample {
                         mp4_writer.write_sample(TRACK_ID, &final_sample)?;
+                    }
+                    // Hide a reordered stream's lead-in, so the track presents
+                    // its first frame at time zero.
+                    if let Some((media_time, segment_duration)) = edit_list_trim {
+                        mp4_writer.set_edit_list(
+                            TRACK_ID,
+                            vec![mp4::EditListEntry {
+                                segment_duration,
+                                media_time,
+                                // Fixed-point 16.16: exactly 1.0, i.e. play at
+                                // normal speed.
+                                media_rate: 1,
+                                media_rate_fraction: 0,
+                            }],
+                        )?;
                     }
                     mp4_writer.write_end()?;
                 }
@@ -1128,6 +1155,12 @@ struct H264Parser {
     /// The last duration derived from a pair of frames, used to extrapolate the
     /// final frame's duration, which has no successor to measure against.
     last_derived_duration: Option<u64>,
+    /// Total duration of every sample emitted so far, in `MOVIE_TIMESCALE` ticks.
+    emitted_ticks: u64,
+    /// Earliest presentation time of any sample emitted so far, in
+    /// `MOVIE_TIMESCALE` ticks. Non-zero for a reordered stream; see
+    /// [`H264Parser::edit_list_trim`].
+    min_pts_ticks: Option<i64>,
     /// stores MP4 sample until written
     last_sample: Option<ParsedH264Frame>,
     first_frame_done: bool,
@@ -1149,6 +1182,8 @@ impl H264Parser {
             pps: None,
             pending: None,
             last_derived_duration: None,
+            emitted_ticks: 0,
+            min_pts_ticks: None,
             last_sample: None,
             first_frame_done: false,
             write_failed: false,
@@ -1319,6 +1354,7 @@ impl H264Parser {
                     }
                 }
             }
+            self.account_emitted(s);
         }
         // Note: as far as I can tell, as of version 0.13.0, the mp4 crate does not
         // use `start_time` for writing the sample. (So we have gone to the trouble
@@ -1348,8 +1384,48 @@ impl H264Parser {
                 Some(dur) => dur.try_into().unwrap(),
                 None => self.last_derived_duration.unwrap_or(0).try_into().unwrap(),
             };
+            self.account_emitted(s);
         }
         sample
+    }
+
+    /// Accumulate what is needed to describe the track's presentation timeline:
+    /// its total length, and the earliest time any frame is shown.
+    fn account_emitted(&mut self, sample: &mp4::Mp4Sample) {
+        let pts = self.emitted_ticks as i64 + sample.rendering_offset as i64;
+        self.min_pts_ticks = Some(match self.min_pts_ticks {
+            Some(min) => min.min(pts),
+            None => pts,
+        });
+        self.emitted_ticks += sample.duration as u64;
+    }
+
+    /// The edit list this track needs, as `(media_time, segment_duration)`.
+    ///
+    /// A reordered stream cannot present its first frame at time zero: a sample
+    /// has to be decoded before it is shown, so composition offsets stay
+    /// non-negative and the presentation timeline necessarily starts a few frames
+    /// into the media. An edit list is how that lead-in is hidden -- `media_time`
+    /// says which media time maps to presentation time zero -- and it is what
+    /// every encoder emits. Without one, a reordered recording reads back with a
+    /// start time equal to its reorder depth.
+    ///
+    /// `segment_duration` is the whole media duration: every sample is shown for
+    /// exactly its own duration, so the presentation timeline is the same length
+    /// as the decode timeline, merely offset. (This matches what ffmpeg writes.)
+    ///
+    /// `None` when presentation already starts at zero, which is every in-order
+    /// stream, and `None` after a failed write, when the totals no longer describe
+    /// what actually reached the file.
+    fn edit_list_trim(&self) -> Option<(std::time::Duration, std::time::Duration)> {
+        if self.write_failed {
+            return None;
+        }
+        let min_pts = self.min_pts_ticks?;
+        if min_pts <= 0 {
+            return None;
+        }
+        Some((raw2dur(min_pts as u64), raw2dur(self.emitted_ticks)))
     }
 }
 
@@ -1509,6 +1585,11 @@ impl openh264::formats::YUVSource for YUVData {
 
 fn dur2raw(dur: &std::time::Duration) -> u64 {
     (dur.as_secs_f64() * MOVIE_TIMESCALE as f64).round() as u64
+}
+
+/// Inverse of [`dur2raw`]: `MOVIE_TIMESCALE` ticks back to a duration.
+fn raw2dur(raw: u64) -> std::time::Duration {
+    std::time::Duration::from_nanos((raw as u128 * 1_000_000_000 / MOVIE_TIMESCALE as u128) as u64)
 }
 
 /// Convert a (possibly negative) composition time offset into raw
