@@ -78,8 +78,21 @@ struct LoadedFrame {
     pts_ns: i64,
     /// Picture order count, reconstructed from the bitstream's own slice
     /// headers (ITU-T H.264 §8.2.1). Only comparable in relative order
-    /// within one file; not a real time value.
+    /// *within one coded video sequence* -- POC restarts at every IDR -- and not
+    /// a real time value. Sort by [`LoadedFrame::display_key`], never by `poc`
+    /// alone.
     poc: i64,
+    /// Which coded video sequence this sample belongs to: 0 for the first, then
+    /// one more at each IDR. Needed because POC restarts there, so a bare POC
+    /// sort interleaves frames from different groups of pictures.
+    cvs: i64,
+}
+
+impl LoadedFrame {
+    /// Sort key putting samples in true display order across the whole file.
+    fn display_key(&self) -> (i64, i64) {
+        (self.cvs, self.poc)
+    }
 }
 
 /// Failure loading a timing series for one timestamp source.
@@ -188,6 +201,16 @@ fn frame_nals(frame: frame_source::FrameData) -> Result<Vec<Vec<u8>>> {
     }
 }
 
+/// Does this sample start a new coded video sequence? An IDR resets POC, so it
+/// is where the display-order sort key has to be bumped.
+fn starts_coded_video_sequence(nals: &[Vec<u8>]) -> bool {
+    nals.iter().any(|nal_bytes| {
+        let nal = RefNal::new(nal_bytes, &[], true);
+        matches!(nal.header(), Ok(h)
+            if h.nal_unit_type() == UnitType::SliceLayerWithoutPartitioningIdr)
+    })
+}
+
 /// Reconstruct picture order count (POC) and read the SEI capture time for
 /// every sample of an already-opened H.264 source.
 fn load_frames<H: SeekableH264Source>(src: &mut H264Source<H>) -> Result<Vec<LoadedFrame>> {
@@ -195,12 +218,16 @@ fn load_frames<H: SeekableH264Source>(src: &mut H264Source<H>) -> Result<Vec<Loa
     reader.seed_from_container(src)?;
 
     let mut frames = Vec::new();
+    let mut cvs = 0i64;
     for frame in src.decode_order_iter() {
         let frame = frame?;
         let pts_ns = frame.timestamp().unwrap_duration().as_nanos() as i64;
         let nals = frame_nals(frame)?;
         let poc = reader.poc_for_frame(&nals)?;
-        frames.push(LoadedFrame { pts_ns, poc });
+        if starts_coded_video_sequence(&nals) && !frames.is_empty() {
+            cvs += 1;
+        }
+        frames.push(LoadedFrame { pts_ns, poc, cvs });
     }
 
     Ok(frames)
@@ -218,11 +245,17 @@ impl Analysis {
     }
 }
 
-/// Compare the bitstream's true picture order (POC) against a timing series:
-/// sort samples by POC and check whether the timestamps come out non-decreasing.
+/// Compare the bitstream's true picture order against a timing series: sort
+/// samples into display order and check whether the timestamps come out
+/// non-decreasing.
+///
+/// Ordering is by `(coded video sequence, POC)`, not by POC alone. POC restarts
+/// at every IDR, so on a file with more than one group of pictures a bare POC
+/// sort interleaves frames from different GOPs and reports inversions in a
+/// perfectly good recording.
 fn analyze(frames: &[LoadedFrame]) -> Analysis {
     let mut order: Vec<usize> = (0..frames.len()).collect();
-    order.sort_by_key(|&i| frames[i].poc);
+    order.sort_by_key(|&i| frames[i].display_key());
 
     let mut num_inversions = 0usize;
     let mut max_inversion_ns = 0i64;
@@ -311,8 +344,18 @@ fn main() -> Result<()> {
 /// capture time, its bitstream POC, and the raw NAL units to re-emit.
 struct FixFrame {
     pts_ns: i64,
+    /// Only ordered within one coded video sequence; see [`FixFrame::display_key`].
     poc: i64,
+    /// Coded-video-sequence index, bumped at each IDR because POC restarts there.
+    cvs: i64,
     nals: Vec<Vec<u8>>,
+}
+
+impl FixFrame {
+    /// Sort key putting samples in true display order across the whole file.
+    fn display_key(&self) -> (i64, i64) {
+        (self.cvs, self.poc)
+    }
 }
 
 /// A whole file loaded for repair.
@@ -368,12 +411,21 @@ fn load_for_fix<H: SeekableH264Source>(
     reader.seed_from_container(src)?;
 
     let mut frames = Vec::new();
+    let mut cvs = 0i64;
     for frame in src.decode_order_iter() {
         let frame = frame?;
         let pts_ns = frame.timestamp().unwrap_duration().as_nanos() as i64;
         let nals = frame_nals(frame)?;
         let poc = reader.poc_for_frame(&nals)?;
-        frames.push(FixFrame { pts_ns, poc, nals });
+        if starts_coded_video_sequence(&nals) && !frames.is_empty() {
+            cvs += 1;
+        }
+        frames.push(FixFrame {
+            pts_ns,
+            poc,
+            cvs,
+            nals,
+        });
     }
 
     Ok(Loaded {
@@ -432,7 +484,7 @@ fn repair_timing(frames: &[FixFrame]) -> Vec<RepairedTiming> {
     let mut sorted_times: Vec<i64> = frames.iter().map(|f| f.pts_ns).collect();
     sorted_times.sort_unstable();
     let mut poc_order: Vec<usize> = (0..n).collect();
-    poc_order.sort_by_key(|&i| frames[i].poc);
+    poc_order.sort_by_key(|&i| frames[i].display_key());
     let mut corrected = vec![0i64; n];
     for (display_rank, &decode_index) in poc_order.iter().enumerate() {
         corrected[decode_index] = sorted_times[display_rank];
@@ -563,6 +615,7 @@ fn analyze_fix(frames: &[FixFrame]) -> Analysis {
         .map(|f| LoadedFrame {
             pts_ns: f.pts_ns,
             poc: f.poc,
+            cvs: f.cvs,
         })
         .collect();
     analyze(&loaded)
@@ -572,8 +625,19 @@ fn analyze_fix(frames: &[FixFrame]) -> Analysis {
 mod tests {
     use super::*;
 
+    /// A sample in the first (or only) coded video sequence.
     fn frame(pts_ns: i64, poc: i64) -> LoadedFrame {
-        LoadedFrame { pts_ns, poc }
+        LoadedFrame {
+            pts_ns,
+            poc,
+            cvs: 0,
+        }
+    }
+
+    /// A sample in coded video sequence `cvs`, for multi-GOP cases where POC has
+    /// restarted.
+    fn frame_in(cvs: i64, pts_ns: i64, poc: i64) -> LoadedFrame {
+        LoadedFrame { pts_ns, poc, cvs }
     }
 
     #[test]
@@ -596,6 +660,116 @@ mod tests {
         assert!(!analysis.is_broken());
     }
 
+    /// Regression test: POC restarts at every IDR, so a file with more than one
+    /// group of pictures must be ordered by `(coded video sequence, POC)`. A bare
+    /// POC sort interleaves the GOPs and reports a perfectly good recording as
+    /// broken -- which is what this tool used to do to any short-GOP file,
+    /// including untouched ffmpeg output.
+    #[test]
+    fn analyze_accepts_multiple_gops_with_restarting_poc() {
+        // Two GOPs of three frames at 10 ns spacing. POC restarts at 0 in the
+        // second GOP, so sorted by POC alone the order would be
+        // 0(cvs0), 0(cvs1), 2(cvs0), 2(cvs1), ... and the timestamps would look
+        // wildly out of order.
+        let frames = vec![
+            frame_in(0, 0, 0),
+            frame_in(0, 10, 2),
+            frame_in(0, 20, 4),
+            frame_in(1, 30, 0),
+            frame_in(1, 40, 2),
+            frame_in(1, 50, 4),
+        ];
+        let analysis = analyze(&frames);
+        assert!(
+            !analysis.is_broken(),
+            "multi-GOP file wrongly reported broken: {} of {} samples inverted",
+            analysis.num_inversions,
+            analysis.num_frames
+        );
+    }
+
+    /// The unit tests above pin the *ordering* rule, but they hand-build the
+    /// coded-video-sequence index. This one drives the real loader over a real
+    /// multi-GOP B-frame recording, so that IDR detection is covered too: if
+    /// [`starts_coded_video_sequence`] ever stopped recognising an IDR, `cvs`
+    /// would stay 0 everywhere and the false positive would come back while every
+    /// other test still passed.
+    ///
+    /// Borrows `frame-source`'s committed fixture rather than duplicating a
+    /// binary blob. The properties this test depends on are asserted rather than
+    /// assumed, so if that fixture is ever regenerated differently the test says
+    /// so instead of quietly passing on a file that no longer exercises anything.
+    #[test]
+    fn real_multi_gop_bframe_recording_is_not_flagged() {
+        let path = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../frame-source/tests/data/bframes.mp4");
+        assert!(path.exists(), "missing fixture {path}");
+
+        let frames = match load(&path, frame_source::TimestampSource::Mp4Pts) {
+            Ok(frames) => frames,
+            Err(LoadError::NoTimestamps) => panic!("{path}: fixture has no container timing"),
+            Err(LoadError::Other(e)) => panic!("{path}: {e:#}"),
+        };
+
+        let max_cvs = frames.iter().map(|f| f.cvs).max().unwrap();
+        assert!(
+            max_cvs >= 1,
+            "fixture must span more than one group of pictures to exercise the \
+             POC-restart case, but every sample landed in sequence 0"
+        );
+        assert!(
+            frames.windows(2).any(|w| w[1].poc < w[0].poc),
+            "fixture must be reordered (POC not monotonic in decode order), \
+             otherwise this proves nothing about B-frame handling"
+        );
+
+        let analysis = analyze(&frames);
+        assert!(
+            !analysis.is_broken(),
+            "a valid {}-GOP recording was reported broken: {} of {} samples \
+             inverted, up to {:.1}ms early",
+            max_cvs + 1,
+            analysis.num_inversions,
+            analysis.num_frames,
+            analysis.max_inversion_ms
+        );
+    }
+
+    /// The multi-GOP fix must not blind the check to real corruption *within* a
+    /// group of pictures.
+    #[test]
+    fn analyze_still_flags_inversion_inside_one_gop() {
+        let frames = vec![
+            frame_in(0, 0, 0),
+            frame_in(0, 10, 2),
+            // Second GOP, but its first frame claims a time before the previous
+            // GOP's last -- genuinely out of order.
+            frame_in(1, 5, 0),
+            frame_in(1, 40, 2),
+        ];
+        assert!(analyze(&frames).is_broken());
+    }
+
+    /// `repair` reassigns capture times by display rank, so it needs the same
+    /// per-sequence POC keying: keyed by POC alone it would shuffle times between
+    /// groups of pictures and corrupt a multi-GOP file it was asked to fix.
+    #[test]
+    fn repair_keeps_capture_times_within_their_gop() {
+        let frames = vec![
+            fix_frame_in(0, 0, 0),
+            fix_frame_in(0, 10, 4),
+            fix_frame_in(0, 20, 2),
+            fix_frame_in(1, 30, 0),
+            fix_frame_in(1, 40, 4),
+            fix_frame_in(1, 50, 2),
+        ];
+        let timing = repair_timing(&frames);
+        let corrected: Vec<i64> = timing.iter().map(|t| t.corrected_pts_ns).collect();
+        // Within each GOP the two later frames swap (POC 4 displays after POC 2),
+        // but no time crosses the GOP boundary.
+        assert_eq!(corrected, vec![0, 20, 10, 30, 50, 40]);
+    }
+
     #[test]
     fn analyze_accepts_reordered_decode_order_with_matching_sei() {
         // Decode order I,P,B,B with POC 0,3,1,2 (P displays last of the
@@ -615,6 +789,16 @@ mod tests {
         FixFrame {
             pts_ns,
             poc,
+            cvs: 0,
+            nals: vec![],
+        }
+    }
+
+    fn fix_frame_in(cvs: i64, pts_ns: i64, poc: i64) -> FixFrame {
+        FixFrame {
+            pts_ns,
+            poc,
+            cvs,
             nals: vec![],
         }
     }
