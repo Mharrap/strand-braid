@@ -887,7 +887,8 @@ mod test {
                     let v = ((px + i * 7) % 256) as u8;
                     chunk[0] = v;
                     chunk[1] = v.wrapping_mul(3);
-                    chunk[2] = v.wrapping_add(i as u8 * 11);
+                    // Wrapping: `i as u8 * 11` overflows past 23 frames.
+                    chunk[2] = v.wrapping_add((i as u8).wrapping_mul(11));
                 }
                 let frame: OImage<RGB8> = OImage::new(w, h, w as usize * 3, data).unwrap();
                 let frame = strand_dynamic_frame::DynamicFrameOwned::from_static(frame);
@@ -1047,7 +1048,8 @@ mod test {
             let v = ((px + i * 7) % 256) as u8;
             chunk[0] = v;
             chunk[1] = v.wrapping_mul(3);
-            chunk[2] = v.wrapping_add(i as u8 * 11);
+            // Wrapping: `i as u8 * 11` overflows past 23 frames.
+            chunk[2] = v.wrapping_add((i as u8).wrapping_mul(11));
         }
         let frame: OImage<RGB8> = OImage::new(w, h, w as usize * 3, data).unwrap();
         strand_dynamic_frame::DynamicFrameOwned::from_static(frame)
