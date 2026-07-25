@@ -93,12 +93,6 @@ impl SrtData {
     fn frame0_time(&self) -> DateTime<FixedOffset> {
         self.frame0_time
     }
-    /// Wall-clock span from the first to the last stanza (presentation order).
-    fn span(&self) -> Result<std::time::Duration> {
-        let first = Self::parse_time(&self.stanzas[0]);
-        let last = Self::parse_time(&self.stanzas[self.stanzas.len() - 1]);
-        Ok(last.signed_duration_since(first).to_std()?)
-    }
 }
 
 /// Per-sample timing carried through from an MP4 source, so it can be
@@ -731,31 +725,13 @@ where
 
         let average_fps = calc_avg_fps(&frame_time_info[..]);
 
-        // Rescale the source's per-sample timing (stts/ctts) to the real
-        // capture cadence given by the SRT. The intermediate encoder uses a
-        // fixed nominal framerate unrelated to the true capture rate, so its
-        // absolute durations are meaningless; only its *relative* reorder
-        // structure (the ratio of composition offset to frame duration) is.
-        // Scaling by real_span/source_span fixes the playback rate while
-        // preserving valid decode/composition ordering (and cancels any
-        // timescale discrepancy in the source durations).
-        let mp4_sample_timing = match (mp4_sample_timing, srt_data.as_ref()) {
-            (Some(mut timing), Some(srt)) if timing.len() >= 2 => {
-                let source_span: f64 = timing.iter().map(|t| t.decode_duration.as_secs_f64()).sum();
-                let real_span = srt.span().map(|d| d.as_secs_f64()).unwrap_or(0.0);
-                if source_span > 0.0 && real_span > 0.0 {
-                    let scale = real_span / source_span;
-                    for t in timing.iter_mut() {
-                        t.decode_duration = t.decode_duration.mul_f64(scale);
-                        let off_ns = t.composition_offset.num_nanoseconds().unwrap_or(0) as f64;
-                        t.composition_offset =
-                            chrono::Duration::nanoseconds((off_ns * scale) as i64);
-                    }
-                }
-                Some(timing)
-            }
-            (other, _) => other,
-        };
+        // Note that the source's per-sample timing (stts/ctts) is passed through
+        // untouched. A caller whose source MP4 has no meaningful capture timing
+        // -- an intermediate encode at a fixed nominal framerate, as
+        // `ffmpeg-rewriter` produces -- asks for it to be re-derived from the
+        // SRT by calling [`Self::retime_container_from_srt`]. Doing that here
+        // instead would corrupt a correctly-timed recording opened with a
+        // sidecar, which is what `mp4-misp-inserter` does.
 
         // SRT stanzas are in presentation order, so pair them with reordered
         // (B-frame) streams by display rank. Fall back to sequential consumption
@@ -789,6 +765,164 @@ where
             chroma_format,
             profile,
         })
+    }
+
+    /// Re-derive the container's per-sample timing (`stts`/`ctts`) from the SRT
+    /// capture times, so the file plays back at the rate it was recorded at.
+    ///
+    /// Only for sources whose own container timing carries no capture
+    /// information -- an intermediate encode at a fixed nominal framerate. A
+    /// recording that is already correctly timed must be left alone; that is why
+    /// this is an explicit call rather than something [`Self::new`] does to every
+    /// source opened with a sidecar.
+    ///
+    /// # What the container is given
+    ///
+    /// Not the raw capture times. An acquisition clock is typically more regular
+    /// than the timestamps recorded against it, so writing those verbatim would
+    /// bake measurement noise into the container, make every file
+    /// variable-framerate, and add nothing -- the exact times are already in the
+    /// per-frame MISP SEI at full precision. Instead the cadence is *estimated*
+    /// and the presentation times snapped to it, while genuine discontinuities
+    /// (a skipped exposure) are preserved as real gaps.
+    ///
+    /// The rate comes from the *span*, `(t_last - t_first) / number of frame
+    /// slots`, not from the median of successive intervals: differencing doubles
+    /// the noise, and the median of the differences is a high-variance statistic
+    /// that can be out by several percent on a short recording. A span-based
+    /// estimate has a noise term of `(jitter_last - jitter_first) / (n - 1)`,
+    /// which shrinks as the recording gets longer.
+    ///
+    /// Each interval is classified as `k` frame slots, `k = round(interval /
+    /// rate)`, so a `k >= 2` interval is a gap of `k` slots. Since the rate is
+    /// needed to classify and the classification changes the rate, the two are
+    /// iterated a few times from `span / (n - 1)`; it converges immediately in
+    /// practice.
+    ///
+    /// # How that becomes stts/ctts
+    ///
+    /// With `p[r]` the snapped presentation time of display rank `r`, decode
+    /// timestamps are `dts[j] = p[j]` -- valid because `p` is increasing, so
+    /// taking it in order is the same as sorting the presentation times -- and
+    /// composition offsets `ctts[j] = p[rank[j]] + shift - dts[j]`.
+    ///
+    /// `shift` is `max(dts[j] - p[rank[j]])`, the smallest constant that keeps
+    /// every offset non-negative. It cannot be dropped: a sample must be decoded
+    /// before it is presented, so `ctts >= 0` is forced for a stream meant to be
+    /// decodable, and a reordered stream therefore *cannot* present its first
+    /// frame at time zero. Real encoders emit exactly this lead-in and then hide
+    /// it with an edit list (`elst`) -- which `mp4-writer` does not yet write, so
+    /// a reordered recording keeps a lead-in of a few frames.
+    pub fn retime_container_from_srt(&mut self) -> Result<()> {
+        let Some(srt) = self.srt_data.as_ref() else {
+            return Err(Error::H264TimestampError(
+                "cannot re-time the container without an SRT sidecar".to_string(),
+            ));
+        };
+        let Some(timing) = self.mp4_sample_timing.as_ref() else {
+            return Err(Error::H264TimestampError(
+                "cannot re-time the container of a source without per-sample timing \
+                 (stts/ctts); this is an MP4-only operation"
+                    .to_string(),
+            ));
+        };
+        let n = timing.len();
+        // A single frame has no interval to measure, so there is no cadence to
+        // estimate and nothing to re-time.
+        if n < 2 {
+            return Ok(());
+        }
+
+        // Capture times relative to frame 0, indexed by display rank: SRT
+        // stanzas are in presentation order.
+        let mut p_capture = Vec::with_capacity(n);
+        for rank in 0..n {
+            p_capture.push(srt.time_at(rank)?.as_nanos() as i64);
+        }
+        let span = p_capture[n - 1] - p_capture[0];
+        // Times that do not advance give nothing to estimate from. Leave the
+        // source timing alone rather than producing zero-length samples.
+        if span <= 0 {
+            return Ok(());
+        }
+
+        // Rate and gap classification, solved together.
+        let intervals: Vec<i64> = p_capture.windows(2).map(|w| w[1] - w[0]).collect();
+        let slots_at = |rate: f64| -> Vec<i64> {
+            intervals
+                .iter()
+                .map(|&iv| ((iv as f64 / rate).round() as i64).max(1))
+                .collect()
+        };
+        let mut rate = span as f64 / (n - 1) as f64;
+        let mut slots = slots_at(rate);
+        for _ in 0..3 {
+            let total: i64 = slots.iter().sum();
+            if total <= 0 {
+                break;
+            }
+            rate = span as f64 / total as f64;
+            let next = slots_at(rate);
+            if next == slots {
+                break;
+            }
+            slots = next;
+        }
+
+        // Snapped presentation times, from the cumulative slot count so that
+        // rounding cannot accumulate across the recording.
+        let mut p = Vec::with_capacity(n);
+        let mut cumulative_slots = 0i64;
+        p.push(0i64);
+        for &k in slots.iter() {
+            cumulative_slots += k;
+            p.push((cumulative_slots as f64 * rate).round() as i64);
+        }
+
+        // `presentation_rank[j]` is the display rank of decode-order sample `j`.
+        // Absent only when neither container PTS nor bitstream POC was available;
+        // assuming decode order is display order is then safe only if the source
+        // itself shows no reordering.
+        let identity: Vec<usize> = (0..n).collect();
+        let rank: &[usize] = match self.presentation_rank.as_deref() {
+            Some(rank) => rank,
+            None => {
+                if timing
+                    .iter()
+                    .any(|t| t.composition_offset != chrono::Duration::zero())
+                {
+                    return Err(Error::H264TimestampError(
+                        "the source is reordered (non-zero ctts) but its presentation \
+                         order could not be recovered, so its timing cannot be re-derived"
+                            .to_string(),
+                    ));
+                }
+                &identity
+            }
+        };
+
+        // Smallest constant lead-in keeping every composition offset >= 0.
+        let shift = (0..n).map(|j| p[j] - p[rank[j]]).max().unwrap_or(0).max(0);
+
+        let rate_ns = rate.round() as i64;
+        let timing = self.mp4_sample_timing.as_mut().unwrap();
+        for j in 0..n {
+            // The last sample has no successor to measure against, so its
+            // duration can only be the estimated cadence.
+            let duration_ns = if j + 1 < n { p[j + 1] - p[j] } else { rate_ns };
+            timing[j].decode_duration = std::time::Duration::from_nanos(duration_ns as u64);
+            timing[j].composition_offset = chrono::Duration::nanoseconds(p[rank[j]] + shift - p[j]);
+        }
+
+        // Keep the presentation timestamps consistent with the timing just
+        // written, so `TimestampSource::Mp4Pts` cannot report the stale cadence.
+        if let Some(mp4_pts) = self.mp4_pts.as_mut() {
+            for (j, pts) in mp4_pts.iter_mut().enumerate() {
+                *pts = std::time::Duration::from_nanos((p[rank[j]] + shift) as u64);
+            }
+        }
+
+        Ok(())
     }
 }
 

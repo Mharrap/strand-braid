@@ -333,6 +333,12 @@ fn write_rewritten(sidecars: &Sidecars, mp4_cfg: Mp4RecordingConfig) -> Result<R
         .srt_file_path(Some(PathBuf::from(&sidecars.srt)))
         .build_h264_in_mp4_source()?;
 
+    // This source is the capture stage's ffmpeg output, encoded at a fixed
+    // nominal framerate unrelated to the rate frames actually arrived at, so its
+    // container timing has to be re-derived from the SRT. A tool re-muxing an
+    // already-correctly-timed recording must not do this.
+    frame_src.retime_container_from_srt()?;
+
     let frame0_time = frame_src.frame0_time().unwrap();
 
     // The source is truncated to whole groups of pictures the SRT has capture
