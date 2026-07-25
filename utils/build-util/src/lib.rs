@@ -227,11 +227,22 @@ pub fn trunk_build(
         }
     }
 
-    // Re-run only when frontend sources or build script change.
-    println!("cargo:rerun-if-changed={frontend_dir}/src");
-    println!("cargo:rerun-if-changed={frontend_dir}/scss");
-    println!("cargo:rerun-if-changed={frontend_dir}/index.html");
-    println!("cargo:rerun-if-changed={frontend_dir}/Trunk.toml");
+    // Re-run only when frontend sources or build script change. A
+    // rerun-if-changed path that doesn't exist makes cargo treat the build
+    // script as perpetually out of date (it has no mtime to compare against),
+    // so every one of these must be gated on actually existing. Trunk.toml in
+    // particular is optional (trunk works fine with its defaults), so not all
+    // callers have one.
+    for rel in [
+        format!("{frontend_dir}/src"),
+        format!("{frontend_dir}/scss"),
+        format!("{frontend_dir}/index.html"),
+        format!("{frontend_dir}/Trunk.toml"),
+    ] {
+        if PathBuf::from(&rel).exists() {
+            println!("cargo:rerun-if-changed={rel}");
+        }
+    }
     println!("cargo:rerun-if-changed=build.rs");
 
     Ok(())
