@@ -605,9 +605,46 @@ struct RepairedTiming {
 /// the sorted capture times onto frames by POC rank therefore restores each
 /// frame's true capture time. We then keep the samples in their existing decode
 /// order (so the bitstream stays valid) and lay down a nominal, evenly spaced
-/// decode timeline with composition offsets (ctts) so that
-/// `decode_time + composition_offset == corrected capture time` for every
-/// sample -- making the container order and the SEI agree.
+/// decode timeline with composition offsets (ctts) placing each sample at its
+/// corrected capture time -- making the container order and the SEI agree.
+///
+/// # Presentation times are the raw capture times
+///
+/// This writes each frame's *exact* recorded capture time into the container,
+/// which makes the output variable-framerate and carries over whatever noise the
+/// capture timestamps hold. That is a deliberate choice for a repair tool and
+/// differs from what `frame-source`'s `retime_container_from_srt` does when
+/// *recording*, where the cadence is estimated and presentation times are snapped
+/// to it -- there, the raw times are already preserved at full precision in the
+/// SEI, so putting noise in the container as well buys nothing. Here we are
+/// reconstructing a file whose timing is known to be wrong, the caller has asked
+/// for the truth to be recovered, and inventing a cadence would discard evidence.
+///
+/// To snap to an estimated grid instead, the change would be: classify each
+/// interval of `sorted_times` as `k = round(interval / rate)` frame slots, solve
+/// `rate = span / total slots` iteratively from `span / (n - 1)` (a span-based
+/// estimate, *not* the median of successive intervals -- differencing doubles the
+/// noise and the median can be several percent out on a short recording), then
+/// replace `corrected[i]` with the cumulative snapped time for that frame's
+/// display rank. Everything below stays as it is. Genuine gaps survive because a
+/// skipped exposure classifies as `k >= 2`.
+///
+/// # Why the lead-in shift is not optional
+///
+/// A sample cannot be presented before it has been decoded, so every composition
+/// offset must be non-negative. Laying `dts` down in decode order while
+/// presentation follows display order means a reordered stream needs presentation
+/// pushed later by a constant: for `I P B B B` with decode timeline `0 d 2d 3d 4d`
+/// and capture times `0 4d d 2d 3d`, the raw offsets would be `0 3d -d -d -d`, and
+/// those three B-frames would claim to be shown a frame before they are decoded.
+/// `shift` is the smallest constant that removes that, and without it the output
+/// is not properly decodable -- which is what this function used to emit.
+///
+/// The shift moves the whole presentation timeline later, so the first frame no
+/// longer sits at zero. `mp4-writer` hides that by emitting an edit list, exactly
+/// as an encoder does. Note that the SEI still carries the unshifted capture time:
+/// `corrected_pts_ns` is the real time the frame was captured, and only the
+/// container's internal timeline is offset.
 fn repair_timing(frames: &[FixFrame]) -> Vec<RepairedTiming> {
     let n = frames.len();
     assert!(n > 0);
@@ -622,6 +659,8 @@ fn repair_timing(frames: &[FixFrame]) -> Vec<RepairedTiming> {
         corrected[decode_index] = sorted_times[display_rank];
     }
 
+    // `n - 1` intervals span `n` samples. Dividing by `n` instead is the
+    // off-by-one that made recordings play a factor `n/(n-1)` too fast.
     let avg_interval_ns: i64 = if n > 1 {
         ((sorted_times[n - 1] - sorted_times[0]) as f64 / (n - 1) as f64).round() as i64
     } else {
@@ -631,12 +670,19 @@ fn repair_timing(frames: &[FixFrame]) -> Vec<RepairedTiming> {
     }
     .max(1);
 
+    // Smallest constant keeping every composition offset non-negative.
+    let shift_ns = (0..n)
+        .map(|i| avg_interval_ns * i as i64 - corrected[i])
+        .max()
+        .unwrap_or(0)
+        .max(0);
+
     (0..n)
         .map(|i| {
             let dts_ns = avg_interval_ns * i as i64;
             RepairedTiming {
                 decode_duration: std::time::Duration::from_nanos(avg_interval_ns as u64),
-                composition_offset: chrono::Duration::nanoseconds(corrected[i] - dts_ns),
+                composition_offset: chrono::Duration::nanoseconds(corrected[i] + shift_ns - dts_ns),
                 corrected_pts_ns: corrected[i],
             }
         })
@@ -1042,18 +1088,44 @@ mod tests {
         let corrected: Vec<i64> = timing.iter().map(|t| t.corrected_pts_ns).collect();
         assert_eq!(corrected, vec![0, 30, 10, 20]);
 
-        // Presentation time (decode time + composition offset) must equal the
+        // Presentation time (decode time + composition offset) must track the
         // corrected capture time and strictly increase in POC display order.
+        //
+        // Tracks it up to a single constant lead-in, not exactly: presentation is
+        // pushed later by the smallest amount that keeps every composition offset
+        // non-negative, because a sample cannot be shown before it is decoded.
+        // The same constant for every frame, so relative timing is untouched, and
+        // `mp4-writer` emits an edit list to hide it.
         let interval = timing[0].decode_duration.as_nanos() as i64;
         let mut by_poc: Vec<usize> = (0..frames.len()).collect();
-        by_poc.sort_by_key(|&i| frames[i].poc);
+        by_poc.sort_by_key(|&i| frames[i].display_key());
+
+        let presentation_of = |i: usize| {
+            interval * i as i64 + timing[i].composition_offset.num_nanoseconds().unwrap()
+        };
+        let shift = presentation_of(0) - timing[0].corrected_pts_ns;
+        assert!(shift >= 0, "lead-in must not be negative");
+
         let mut prev = i64::MIN;
         for &i in &by_poc {
-            let dts = interval * i as i64;
-            let presentation = dts + timing[i].composition_offset.num_nanoseconds().unwrap();
-            assert_eq!(presentation, timing[i].corrected_pts_ns);
+            let presentation = presentation_of(i);
+            assert_eq!(
+                presentation - shift,
+                timing[i].corrected_pts_ns,
+                "sample {i} is not offset by the same constant as the rest"
+            );
             assert!(presentation > prev, "presentation must increase by POC");
             prev = presentation;
+        }
+
+        // Every composition offset non-negative: the output has to be decodable,
+        // and a negative offset would claim a frame is shown before it is decoded.
+        for (i, t) in timing.iter().enumerate() {
+            assert!(
+                t.composition_offset.num_nanoseconds().unwrap() >= 0,
+                "sample {i} has a negative composition offset, so it would be \
+                 presented before it is decoded"
+            );
         }
 
         // The repaired stream now passes the tool's own consistency check.
