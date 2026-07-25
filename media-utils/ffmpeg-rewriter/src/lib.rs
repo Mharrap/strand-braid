@@ -736,6 +736,7 @@ fn maybe_crash_mid_rewrite(_frames_written: usize) {}
 #[cfg(test)]
 mod test {
     use super::*;
+    use chrono::Utc;
     use machine_vision_formats::{owned::OImage, pixel_format::RGB8};
 
     use test_log::test;
@@ -963,6 +964,460 @@ mod test {
 
         // And the set of capture times must match what we wrote.
         assert_eq!(ordered_sei, timestamps);
+
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------------
+    // Container timing invariants
+    //
+    // A finished recording must satisfy three things:
+    //
+    //   I1. No re-timing. Container timing that is already correct is passed
+    //       through, not re-derived. Enforced where it has a contract to
+    //       break -- `mp4-misp-inserter`, which documents verbatim
+    //       `stts`/`ctts` passthrough -- so it is tested there, not here. On
+    //       this path there is nothing to preserve: the intermediate ffmpeg
+    //       pass encodes at a fixed nominal framerate, so its absolute
+    //       durations carry no capture information at all.
+    //
+    //   I2. The per-frame MISP precision-timestamp SEI carries the exact
+    //       capture time. Covered by the tests above; re-asserted in
+    //       [`test_capture_jitter_does_not_reach_container`] alongside I3, to
+    //       pin that satisfying I3 does not come at I2's expense.
+    //
+    //   I3. The container plays back at 100% of real time: presentation
+    //       intervals track the real capture cadence, genuine discontinuities
+    //       (skipped frames) survive as real gaps, and capture-timestamp noise
+    //       is rejected rather than baked in.
+    //
+    // The I3 tests below FAIL as of this commit. `H264Source` scales the
+    // source's sample durations by a single factor `real_span / source_span`
+    // (see `h264_source.rs`), where `real_span` is the first-to-last capture
+    // time -- n-1 intervals -- but `source_span` sums all n sample durations.
+    // Playback therefore comes out a factor n/(n-1) too fast, and a single
+    // scalar cannot represent a gap no matter what value it takes.
+    // ----------------------------------------------------------------------
+
+    const BASE_MICROS: i64 = 1_662_921_288_000_000; // Sun, 11 Sep 2022 18:34:48 UTC
+    /// 25 fps.
+    const FRAME_INTERVAL_US: i64 = 40_000;
+    /// Frames per timing-invariant recording. Small on purpose: the
+    /// `real_span / source_span` error is `n/(n-1)`, so a short recording is
+    /// where it is large enough to see (2 ms per frame at n = 20) -- and short
+    /// recordings are exactly what the crash-repair paths produce.
+    const TIMING_TEST_FRAMES: usize = 20;
+    /// One tick of the movie timescale `mp4-writer` emits (90 kHz), rounded up.
+    const TIMESCALE_TICK_US: i64 = 12;
+
+    /// Tolerance for a presentation interval of nominal length `interval_us`.
+    ///
+    /// The two legitimate error sources differ in character, so the tolerance
+    /// has two terms. Requantizing into the 90 kHz movie timescale costs a fixed
+    /// fraction of a tick per interval however fast the camera runs, which is an
+    /// absolute floor; a cadence estimator's residual, by contrast, scales with
+    /// the interval. A single absolute number would be either far too loose at
+    /// 500 fps or impossible to meet at 25 fps.
+    ///
+    /// Both terms stay under `interval_us / n`, which is what the `n/(n-1)`
+    /// error amounts to (5% of an interval at n = 20), so the bug stays visible
+    /// as the cadence rises: 2000 us of error against a 200 us tolerance at
+    /// 25 fps, 100 us against 48 us at 500 fps.
+    ///
+    /// That margin does run out. By 1000 fps the error is 50 us against a 48 us
+    /// floor, because `mp4-writer` fixes the movie timescale at 90 kHz: a tick is
+    /// then 1.1% of a frame interval, so a 5% cadence error is only about four
+    /// ticks. A test at kHz frame rates would need a finer timescale rather than
+    /// a tighter tolerance -- four ticks is already the honest floor, an interval
+    /// being a difference of two rounded values that can each be out by one.
+    fn interval_tolerance_us(interval_us: i64) -> i64 {
+        (4 * TIMESCALE_TICK_US).max(interval_us / 200)
+    }
+
+    /// Whether the intermediate encode is expected to reorder frames.
+    ///
+    /// Worth testing both: reordered is the ordinary case for our recordings
+    /// (`FfmpegCodecArgs::max_bframes` defaults to `None`, i.e. ffmpeg's own
+    /// B-frames-on default, since B-frame decoding was fixed), but the in-order
+    /// path is what runs whenever a caller passes `-bf 0`, and it is the path
+    /// where a fix can most easily be written to depend on `ctts` being present.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Reorder {
+        /// B-frames: decode order differs from presentation order, and `ctts` is
+        /// non-zero for some samples.
+        Reordered,
+        /// `-bf 0`: decode order *is* presentation order, every `ctts` is zero.
+        InOrder,
+    }
+
+    impl Reorder {
+        fn codec_args(self) -> FfmpegCodecArgs {
+            match self {
+                // A fixed B-frame pattern (`b_adapt=0` takes the content out of
+                // the encoder's decision) so the stream is definitely reordered.
+                Self::Reordered => FfmpegCodecArgs {
+                    device_args: None,
+                    pre_codec_args: None,
+                    codec: Some("libx264".to_string()),
+                    post_codec_args: Some(vec![
+                        ("-bf".to_string(), "3".to_string()),
+                        (
+                            "-x264-params".to_string(),
+                            "b_adapt=0:scenecut=0:keyint=1000:min-keyint=1000".to_string(),
+                        ),
+                    ]),
+                    pixfmt: Some("yuv420p".to_string()),
+                    max_bframes: None,
+                },
+                Self::InOrder => FfmpegCodecArgs {
+                    max_bframes: Some(0),
+                    ..Default::default()
+                },
+            }
+        }
+    }
+
+    /// Record one frame per entry of `timestamps` through [`FfmpegReWriter`]
+    /// (capture stage then rewrite stage), leaving the finished recording at
+    /// `mp4_fname`. Frame content varies so the encoder has real motion to
+    /// reorder around.
+    fn record_recording(
+        mp4_fname: &Path,
+        timestamps: &[DateTime<Utc>],
+        reorder: Reorder,
+    ) -> Result<()> {
+        let (w, h) = (64u32, 48u32);
+        let mut wtr = FfmpegReWriter::new(mp4_fname, reorder.codec_args(), None, None)?;
+        for (i, ts) in timestamps.iter().enumerate() {
+            let mut data = vec![0u8; w as usize * h as usize * 3];
+            for (px, chunk) in data.chunks_exact_mut(3).enumerate() {
+                let v = ((px + i * 7) % 256) as u8;
+                chunk[0] = v;
+                chunk[1] = v.wrapping_mul(3);
+                // Wrapping, not `i as u8 * 11`: that overflows in a debug build
+                // as soon as a recording is longer than 23 frames.
+                chunk[2] = v.wrapping_add((i as u8).wrapping_mul(11));
+            }
+            let frame: OImage<RGB8> = OImage::new(w, h, w as usize * 3, data).unwrap();
+            let frame = strand_dynamic_frame::DynamicFrameOwned::from_static(frame);
+            wtr.write_dynamic_frame(&frame.borrow(), *ts)?;
+        }
+        wtr.close()?;
+        Ok(())
+    }
+
+    /// One sample's container timing, paired with the capture time its MISP SEI
+    /// carries.
+    struct PresentedSample {
+        /// Presentation timestamp: `dts + ctts`, where `dts` is the running sum
+        /// of the durations of the samples *before* this one.
+        pts: chrono::Duration,
+        sei: DateTime<Utc>,
+    }
+
+    /// Read a finished recording's container timing and per-frame SEI capture
+    /// times, returned in presentation order.
+    ///
+    /// Opened deliberately *without* an SRT sidecar: handing `H264Source` one
+    /// makes it rescale the very `stts`/`ctts` values under test here.
+    ///
+    /// `reorder` is checked against the file rather than assumed, so a test
+    /// meaning to cover the reordered path cannot go quietly vacuous if the
+    /// encoder declines to emit B-frames -- nor the in-order test pass because
+    /// it accidentally got them.
+    fn read_presentation_order(mp4_fname: &Path, reorder: Reorder) -> Result<Vec<PresentedSample>> {
+        use frame_source::h264_source::Mp4SampleTiming;
+
+        let mut frame_src = frame_source::FrameSourceBuilder::new(mp4_fname)
+            .do_decode_h264(false)
+            .timestamp_source(frame_source::TimestampSource::MispMicrosectime)
+            .build_h264_in_mp4_source()?;
+        let frame0_time = frame_src.frame0_time().unwrap();
+        let timing: Vec<Mp4SampleTiming> = frame_src
+            .mp4_sample_timing()
+            .expect("MP4 source must expose per-sample timing")
+            .to_vec();
+        let found = if timing
+            .iter()
+            .any(|t| t.composition_offset != chrono::Duration::zero())
+        {
+            Reorder::Reordered
+        } else {
+            Reorder::InOrder
+        };
+        assert_eq!(
+            found, reorder,
+            "the encode produced a {found:?} stream but the test is written for \
+             {reorder:?} (judged by whether any ctts offset is non-zero)"
+        );
+
+        let mut sei = vec![None; timing.len()];
+        for frame in frame_src.decode_order_iter() {
+            let frame = frame?;
+            sei[frame.idx()] = Some((frame0_time + frame.timestamp().unwrap_duration()).to_utc());
+        }
+
+        let mut dts = chrono::Duration::zero();
+        let mut samples = Vec::with_capacity(timing.len());
+        for (i, t) in timing.iter().enumerate() {
+            samples.push(PresentedSample {
+                pts: dts + t.composition_offset,
+                sei: sei[i].expect("every sample must carry a SEI capture time"),
+            });
+            dts += chrono::Duration::from_std(t.decode_duration).unwrap();
+        }
+        samples.sort_by_key(|s| s.pts);
+        Ok(samples)
+    }
+
+    /// Successive presentation intervals, in microseconds.
+    fn pts_intervals_us(samples: &[PresentedSample]) -> Vec<i64> {
+        samples
+            .windows(2)
+            .map(|w| (w[1].pts - w[0].pts).num_microseconds().unwrap())
+            .collect()
+    }
+
+    /// Capture times on an exact `interval_us` cadence.
+    fn exact_cadence(n: usize, interval_us: i64) -> Vec<DateTime<Utc>> {
+        (0..n as i64)
+            .map(|i| DateTime::from_timestamp_micros(BASE_MICROS + i * interval_us).unwrap())
+            .collect()
+    }
+
+    fn assert_interval_near(actual_us: i64, expected_us: i64, idx: usize, what: &str) {
+        let tolerance = interval_tolerance_us(expected_us);
+        assert!(
+            (actual_us - expected_us).abs() <= tolerance,
+            "{what}: presentation interval {idx} is {actual_us} us, expected \
+             {expected_us} us (tolerance {tolerance} us)"
+        );
+    }
+
+    /// I3: a recording made at a constant cadence must play back at that
+    /// cadence. Every presentation interval, and the total presentation span,
+    /// must match the capture cadence.
+    ///
+    /// Currently fails: intervals come out at `span / n` rather than
+    /// `span / (n-1)`, i.e. 38 ms instead of 40 ms at n = 20 -- 5% fast.
+    fn check_constant_cadence(reorder: Reorder) -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let mp4_fname = tempdir.path().join("out.mp4");
+        let timestamps = exact_cadence(TIMING_TEST_FRAMES, FRAME_INTERVAL_US);
+
+        record_recording(&mp4_fname, &timestamps, reorder)?;
+        let samples = read_presentation_order(&mp4_fname, reorder)?;
+        assert_eq!(samples.len(), TIMING_TEST_FRAMES);
+
+        for (i, interval) in pts_intervals_us(&samples).into_iter().enumerate() {
+            assert_interval_near(interval, FRAME_INTERVAL_US, i, "constant cadence");
+        }
+
+        // The span from first to last presented frame is n-1 intervals; the
+        // file's total duration is one further frame beyond that.
+        let span_us = (samples.last().unwrap().pts - samples[0].pts)
+            .num_microseconds()
+            .unwrap();
+        let expected_span_us = (TIMING_TEST_FRAMES as i64 - 1) * FRAME_INTERVAL_US;
+        assert!(
+            (span_us - expected_span_us).abs() <= interval_tolerance_us(FRAME_INTERVAL_US),
+            "presentation span is {span_us} us, expected {expected_span_us} us"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_container_cadence_matches_capture_cadence() -> Result<()> {
+        check_constant_cadence(Reorder::Reordered)
+    }
+
+    /// The same invariant on a stream with no B-frames. Not redundant: with
+    /// every `ctts` zero, presentation time is carried entirely by the `stts`
+    /// durations, so this is the case a fix could get right by accident on the
+    /// reordered path (by adjusting composition offsets) while leaving plain
+    /// recordings wrong -- or vice versa.
+    #[test]
+    fn test_container_cadence_matches_capture_cadence_in_order() -> Result<()> {
+        check_constant_cadence(Reorder::InOrder)
+    }
+
+    /// I3: a skipped frame is a real discontinuity in the capture cadence and
+    /// must survive as a real gap in the container, not be smeared across the
+    /// whole recording.
+    ///
+    /// Currently fails, and would still fail under any single global scale
+    /// factor: one scalar applied to a uniform-cadence source cannot produce a
+    /// non-uniform output. Representing this needs per-sample durations.
+    fn check_skipped_frame_gap(reorder: Reorder) -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let mp4_fname = tempdir.path().join("out.mp4");
+
+        // One frame's worth of extra delay before frame 10, as though the
+        // camera delivered 20 frames but skipped one exposure partway.
+        const SKIP_BEFORE: usize = 10;
+        let timestamps: Vec<_> = (0..TIMING_TEST_FRAMES as i64)
+            .map(|i| {
+                let extra = if i as usize >= SKIP_BEFORE {
+                    FRAME_INTERVAL_US
+                } else {
+                    0
+                };
+                DateTime::from_timestamp_micros(BASE_MICROS + i * FRAME_INTERVAL_US + extra)
+                    .unwrap()
+            })
+            .collect();
+
+        record_recording(&mp4_fname, &timestamps, reorder)?;
+        let samples = read_presentation_order(&mp4_fname, reorder)?;
+        assert_eq!(samples.len(), TIMING_TEST_FRAMES);
+
+        for (i, interval) in pts_intervals_us(&samples).into_iter().enumerate() {
+            let expected = if i == SKIP_BEFORE - 1 {
+                2 * FRAME_INTERVAL_US
+            } else {
+                FRAME_INTERVAL_US
+            };
+            assert_interval_near(interval, expected, i, "skipped frame");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_skipped_frame_becomes_a_gap() -> Result<()> {
+        check_skipped_frame_gap(Reorder::Reordered)
+    }
+
+    /// The same gap, on a stream with no B-frames. This is the simpler case to
+    /// get right -- a gap is just a longer `stts` duration, with no composition
+    /// offsets to keep consistent -- so it is worth pinning separately.
+    #[test]
+    fn test_skipped_frame_becomes_a_gap_in_order() -> Result<()> {
+        check_skipped_frame_gap(Reorder::InOrder)
+    }
+
+    /// I3 (and I2): jitter in the recorded capture *timestamps* must not reach
+    /// the container. The acquisition clock is more regular than the timestamps
+    /// we manage to record against it, so the container should carry the best
+    /// estimate of the true cadence -- a clean grid -- while the raw, noisy
+    /// times stay in the MISP SEI where full precision belongs.
+    ///
+    /// The jitter-rejection half of this happens to hold today, as a
+    /// side-effect of scaling a uniform source by a scalar; it is asserted here
+    /// so that moving to per-sample durations cannot quietly regress it into
+    /// writing noisy VFR timing. The cadence half fails today, as in
+    /// [`test_container_cadence_matches_capture_cadence`].
+    ///
+    /// Note what the tolerance rules out. Estimating the cadence as the
+    /// *median of successive intervals* is not good enough: differencing
+    /// doubles the noise and the median of 19 such differences is a
+    /// high-variance statistic. On the jitter pattern below it returns
+    /// 41300 us rather than 40000 us -- a 3.2% rate error, worse than the
+    /// `n/(n-1)` bug this file is about. The estimate has to come from the
+    /// *span*, `(last - first) / (n - 1)`, whose noise term is
+    /// `(jitter_last - jitter_first) / (n - 1)` and so shrinks with the length
+    /// of the recording: 16 us here, and bounded by 210 us for any jitter
+    /// within the +/- 2 ms modelled here. Once gaps are detected they must be
+    /// excluded from that estimate -- see
+    /// [`test_skipped_frame_becomes_a_gap`] -- making the estimator
+    /// `(span - total gap excess) / (number of non-gap intervals)`.
+    #[test]
+    fn test_capture_jitter_does_not_reach_container() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let mp4_fname = tempdir.path().join("out.mp4");
+
+        // Deterministic +/- 2 ms of timestamp noise on an exact 40 ms grid.
+        // Well inside one frame interval, so capture times stay monotonic.
+        const JITTER_US: [i64; 10] = [0, 1300, -900, 2000, -1700, 600, -400, 1100, -2000, 300];
+        let timestamps: Vec<_> = (0..TIMING_TEST_FRAMES)
+            .map(|i| {
+                let t = BASE_MICROS + i as i64 * FRAME_INTERVAL_US + JITTER_US[i % JITTER_US.len()];
+                DateTime::from_timestamp_micros(t).unwrap()
+            })
+            .collect();
+
+        record_recording(&mp4_fname, &timestamps, Reorder::Reordered)?;
+        let samples = read_presentation_order(&mp4_fname, Reorder::Reordered)?;
+        assert_eq!(samples.len(), TIMING_TEST_FRAMES);
+
+        for (i, interval) in pts_intervals_us(&samples).into_iter().enumerate() {
+            assert_interval_near(interval, FRAME_INTERVAL_US, i, "jittered capture");
+        }
+
+        // I2: the SEI still carries the exact times handed to the writer,
+        // jitter and all -- the container being regularized must not round the
+        // recorded capture times.
+        let sei: Vec<_> = samples.iter().map(|s| s.sei).collect();
+        assert_eq!(sei, timestamps);
+
+        Ok(())
+    }
+
+    /// The first presented frame of a reordered stream cannot sit at PTS 0
+    /// while every `ctts` stays non-negative, so a constant lead-in is
+    /// expected. What must not happen is that lead-in growing with the length
+    /// of the recording: it is a fixed reorder depth, not an accumulating
+    /// offset.
+    ///
+    /// (Emitting PTS 0 for the first frame would need signed composition
+    /// offsets, i.e. a `ctts` version 1 box. The vendored mp4 fork writes
+    /// `CttsBox` with `version: 0` while serializing `sample_offset` as `i32`,
+    /// so negative offsets would go out mislabeled as unsigned.)
+    ///
+    /// Checked at two recording lengths, since a bound at a single length cannot
+    /// tell a fixed reorder lead-in from one that grows with `n` -- the latter
+    /// being the only thing here that would really be a bug.
+    ///
+    /// The lead-in is measured in *frame intervals*, not microseconds. In
+    /// microseconds it currently does differ between the two lengths (76.0 ms at
+    /// n = 20 against 78.7 ms at n = 60), but only because the `n/(n-1)` error
+    /// makes the frame duration itself a function of `n`: the lead-in is exactly
+    /// 2.000 frames in both. Asserting on microseconds would make this test fail
+    /// for a cadence bug that
+    /// [`test_container_cadence_matches_capture_cadence`] already owns, and
+    /// report it under a misleading name. This test passes today, which is
+    /// honest -- the reorder depth is not what is broken.
+    #[test]
+    fn test_presentation_start_offset_is_a_bounded_lead_in() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        /// `-bf 3` gives a reorder depth of at most this many frames.
+        const MAX_LEAD_IN_FRAMES: f64 = 4.0;
+
+        let mut lead_ins = Vec::new();
+        for (label, n_frames) in [
+            ("short", TIMING_TEST_FRAMES),
+            ("long", 3 * TIMING_TEST_FRAMES),
+        ] {
+            let mp4_fname = tempdir.path().join(format!("{label}.mp4"));
+            let timestamps = exact_cadence(n_frames, FRAME_INTERVAL_US);
+            record_recording(&mp4_fname, &timestamps, Reorder::Reordered)?;
+            let samples = read_presentation_order(&mp4_fname, Reorder::Reordered)?;
+            assert_eq!(samples.len(), n_frames);
+
+            // The file's own cadence, so this measures reorder depth rather than
+            // whether the cadence itself is right.
+            let mut intervals = pts_intervals_us(&samples);
+            intervals.sort_unstable();
+            let interval = intervals[intervals.len() / 2];
+            let start_us = samples[0].pts.num_microseconds().unwrap();
+            let lead_in = start_us as f64 / interval as f64;
+
+            assert!(
+                (0.0..=MAX_LEAD_IN_FRAMES).contains(&lead_in),
+                "{label} recording ({n_frames} frames): first presented frame is \
+                 {lead_in:.3} frames in; expected a reorder lead-in within \
+                 0..={MAX_LEAD_IN_FRAMES} frames"
+            );
+            lead_ins.push((label, n_frames, lead_in));
+        }
+
+        // Tripling the recording length must not move the lead-in: it is a
+        // property of the encoder's reorder depth, not of how long we recorded.
+        assert!(
+            (lead_ins[0].2 - lead_ins[1].2).abs() < 0.05,
+            "reorder lead-in grew with recording length: {lead_ins:?}"
+        );
 
         Ok(())
     }

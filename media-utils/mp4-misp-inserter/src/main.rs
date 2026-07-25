@@ -591,4 +591,152 @@ mod test {
 
         Ok(())
     }
+
+    // ----------------------------------------------------------------------
+    // Invariant I1: no re-timing
+    //
+    // This tool's contract, stated at the top of the module: "The container's
+    // original per-sample timing (`stts`/`ctts`) is preserved verbatim". Only
+    // new SEI NAL units are spliced in; the samples and their timing are
+    // copied through. Whatever timing the caller's MP4 already carries is
+    // theirs, and re-deriving it here would silently corrupt a correctly-timed
+    // recording.
+    //
+    // Both tests below FAIL as of this commit. `H264Source` rescales
+    // `stts`/`ctts` by `real_span / source_span` whenever an SRT sidecar is
+    // supplied (see `h264_source.rs`) -- which for this tool is always, since
+    // the SRT *is* the timestamp source. With `real_span` spanning n-1 capture
+    // intervals against a `source_span` summing all n durations, the factor is
+    // `(n-1)/n` rather than 1, so every duration is shortened by one n-th even
+    // when the input timing was already exactly right.
+    //
+    // The rescale exists for `ffmpeg-rewriter`, whose source MP4 is an
+    // intermediate encode at a nominal framerate with no capture timing to
+    // preserve. Two callers, opposite requirements, one unconditional code
+    // path.
+    // ----------------------------------------------------------------------
+
+    /// Per-sample container timing of `mp4_path`, in decode order.
+    ///
+    /// Read deliberately *without* an SRT sidecar, since supplying one is what
+    /// triggers the rescale being tested for.
+    fn container_timing(mp4_path: &Utf8PathBuf) -> Result<Vec<Mp4SampleTiming>> {
+        let frame_src = frame_source::FrameSourceBuilder::new(mp4_path)
+            .do_decode_h264(false)
+            .timestamp_source(frame_source::TimestampSource::BestGuess)
+            .build_h264_in_mp4_source()?;
+        Ok(frame_src
+            .mp4_sample_timing()
+            .expect("MP4 source must expose per-sample timing")
+            .to_vec())
+    }
+
+    /// Assert `got` reproduces `want` sample for sample.
+    ///
+    /// Compared with a tolerance rather than bit-exactly: the input is written
+    /// by ffmpeg in its own media timescale while `mp4-writer` re-emits at
+    /// `MOVIE_TIMESCALE` (90 kHz, 11.1 us per tick), so a faithful copy can
+    /// still differ by a tick of requantization. The (n-1)/n rescale this
+    /// guards against is two orders of magnitude larger -- 2 ms per frame at
+    /// n = 20.
+    fn assert_timing_preserved(got: &[Mp4SampleTiming], want: &[Mp4SampleTiming]) {
+        const TOLERANCE_US: i64 = 50;
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "sample count changed by the remux: {} -> {}",
+            want.len(),
+            got.len()
+        );
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            let d_us = g.decode_duration.as_micros() as i64 - w.decode_duration.as_micros() as i64;
+            assert!(
+                d_us.abs() <= TOLERANCE_US,
+                "sample {i}: stts duration changed from {:?} to {:?} ({d_us} us)",
+                w.decode_duration,
+                g.decode_duration
+            );
+            let c_us = (g.composition_offset - w.composition_offset)
+                .num_microseconds()
+                .unwrap();
+            assert!(
+                c_us.abs() <= TOLERANCE_US,
+                "sample {i}: ctts offset changed from {:?} to {:?} ({c_us} us)",
+                w.composition_offset,
+                g.composition_offset
+            );
+        }
+    }
+
+    /// I1 for an in-order stream: inserting MISP SEI must leave the container's
+    /// per-sample timing exactly as it found it.
+    #[test]
+    fn test_container_timing_preserved_verbatim() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let (mp4_path, srt_path, out_path) = test_paths(tempdir.path());
+        let timestamps = test_timestamps(20);
+
+        let ffmpeg_codec_args = FfmpegCodecArgs {
+            max_bframes: Some(0),
+            ..Default::default()
+        };
+        write_test_video_with_srt(&mp4_path, &srt_path, ffmpeg_codec_args, 64, 48, &timestamps)?;
+
+        let before = container_timing(&mp4_path)?;
+        insert_misp(
+            &mp4_path,
+            &out_path,
+            frame_source::TimestampSource::SrtFile,
+            Some(srt_path.into()),
+        )?;
+        let after = container_timing(&out_path)?;
+
+        assert_timing_preserved(&after, &before);
+        Ok(())
+    }
+
+    /// I1 for a reordered stream. Separate from the in-order case because the
+    /// `ctts` composition offsets are rescaled too, so a reordered input has
+    /// strictly more timing state to corrupt.
+    #[test]
+    fn test_container_timing_preserved_verbatim_with_bframes() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let (mp4_path, srt_path, out_path) = test_paths(tempdir.path());
+        let timestamps = test_timestamps(24);
+
+        let ffmpeg_codec_args = FfmpegCodecArgs {
+            device_args: None,
+            pre_codec_args: None,
+            codec: Some("libx264".to_string()),
+            post_codec_args: Some(vec![
+                ("-bf".to_string(), "3".to_string()),
+                (
+                    "-x264-params".to_string(),
+                    "b_adapt=0:scenecut=0:keyint=1000:min-keyint=1000".to_string(),
+                ),
+            ]),
+            pixfmt: Some("yuv420p".to_string()),
+            max_bframes: None,
+        };
+        write_test_video_with_srt(&mp4_path, &srt_path, ffmpeg_codec_args, 64, 48, &timestamps)?;
+
+        let before = container_timing(&mp4_path)?;
+        assert!(
+            before
+                .iter()
+                .any(|t| t.composition_offset != chrono::Duration::zero()),
+            "expected libx264 to emit B-frames (non-zero ctts); test would be vacuous otherwise"
+        );
+
+        insert_misp(
+            &mp4_path,
+            &out_path,
+            frame_source::TimestampSource::SrtFile,
+            Some(srt_path.into()),
+        )?;
+        let after = container_timing(&out_path)?;
+
+        assert_timing_preserved(&after, &before);
+        Ok(())
+    }
 }
