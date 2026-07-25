@@ -148,33 +148,137 @@ struct SourceCheck {
     analysis: Analysis,
 }
 
-/// Run every applicable timing-vs-POC check for `path`.
+/// Total span of a timing series: last timestamp minus first, however the
+/// samples happen to be ordered.
+fn span_ns(frames: &[LoadedFrame]) -> i64 {
+    match (
+        frames.iter().map(|f| f.pts_ns).min(),
+        frames.iter().map(|f| f.pts_ns).max(),
+    ) {
+        (Some(min), Some(max)) => max - min,
+        _ => 0,
+    }
+}
+
+/// Does the container play the recording back over the same length of time it
+/// took to capture?
+///
+/// Ordering is not the only way container timing goes wrong: it can be in the
+/// right order and still run at the wrong *rate*. That is what the
+/// `real_span / source_span` scaling bug did -- it divided by the sum of all `n`
+/// sample durations while the capture span covers only `n-1` intervals, so
+/// playback came out a factor `n/(n-1)` too fast. [`analyze`] cannot see this at
+/// all: a uniformly compressed timeline is still perfectly monotonic.
+///
+/// Compared as *spans* rather than per frame, because a container is entitled to
+/// differ from the SEI frame by frame. Capture timestamps carry noise the
+/// acquisition clock does not, so a writer may deliberately snap presentation
+/// times to an estimated cadence; that changes individual frames but preserves
+/// the total, so a span comparison ignores it and still catches a systematic rate
+/// error.
+struct CadenceCheck {
+    container_span_ns: i64,
+    sei_span_ns: i64,
+    /// Mean capture interval -- one frame's worth of time.
+    mean_interval_ns: i64,
+}
+
+impl CadenceCheck {
+    /// How far the container's total timeline is from the captured one.
+    fn drift_ns(&self) -> i64 {
+        (self.container_span_ns - self.sei_span_ns).abs()
+    }
+
+    /// Fractional rate error, positive when the container plays too fast.
+    fn rate_error(&self) -> f64 {
+        if self.container_span_ns == 0 {
+            return 0.0;
+        }
+        self.sei_span_ns as f64 / self.container_span_ns as f64 - 1.0
+    }
+
+    /// Broken once the whole timeline is out by more than half a frame.
+    ///
+    /// Half a frame is the natural threshold rather than an arbitrary percentage:
+    /// quantizing into the movie timescale costs only a tick or two, while the
+    /// `n/(n-1)` bug drifts by `span/n`, which *is* the mean interval -- one whole
+    /// frame, at any recording length. So this catches that bug whether the file
+    /// holds 20 frames or 20000, and stays quiet for merely rounded timing.
+    fn is_broken(&self) -> bool {
+        self.mean_interval_ns > 0 && self.drift_ns() * 2 > self.mean_interval_ns
+    }
+
+    fn describe(&self) -> String {
+        let faster_or_slower = if self.container_span_ns < self.sei_span_ns {
+            "fast"
+        } else {
+            "slow"
+        };
+        format!(
+            "container plays {:.2}% too {faster_or_slower}: its timeline spans {:.1}ms \
+             against {:.1}ms of capture, a drift of {:.1}ms (~{:.2} frames)",
+            self.rate_error().abs() * 100.0,
+            self.container_span_ns as f64 / 1e6,
+            self.sei_span_ns as f64 / 1e6,
+            self.drift_ns() as f64 / 1e6,
+            self.drift_ns() as f64 / self.mean_interval_ns as f64,
+        )
+    }
+}
+
+/// Everything checked for one file.
+struct FileReport {
+    /// Each available timing series, checked against bitstream display order.
+    sources: Vec<SourceCheck>,
+    /// Container rate against capture rate. `None` unless the file has both
+    /// container timing and SEI, and at least two frames spanning some time.
+    cadence: Option<CadenceCheck>,
+}
+
+impl FileReport {
+    fn num_frames(&self) -> usize {
+        self.sources
+            .first()
+            .map(|c| c.analysis.num_frames)
+            .unwrap_or(0)
+    }
+}
+
+/// Run every applicable check for `path`.
 ///
 /// An MP4 always carries container timing (the `stts`/`ctts` boxes, which is
 /// what players use to order frames), so that is checked for every MP4 --
 /// including plain ffmpeg recordings with no SEI. The per-frame
 /// precision-timestamp SEI (written by strand-cam / braid) is checked whenever
-/// it is present; for a raw Annex B `.h264` file it is the only signal.
-fn check_file(path: &Utf8PathBuf) -> Result<Vec<SourceCheck>> {
+/// it is present; for a raw Annex B `.h264` file it is the only signal. When both
+/// are present they are also checked against each other for rate, which is a
+/// different fault from ordering; see [`CadenceCheck`].
+fn check_file(path: &Utf8PathBuf) -> Result<FileReport> {
     let is_mp4 = path.extension().map(|e| e.to_lowercase()).as_deref() == Some("mp4");
-    let mut checks = Vec::new();
+    let mut sources = Vec::new();
+    let mut container_frames = None;
+    let mut sei_frames = None;
 
     if is_mp4 {
         let frames = load(path, frame_source::TimestampSource::Mp4Pts).map_err(|e| match e {
             LoadError::NoTimestamps => eyre!("\"{path}\": MP4 has no container sample timing"),
             LoadError::Other(r) => r,
         })?;
-        checks.push(SourceCheck {
+        sources.push(SourceCheck {
             label: "container (stts/ctts)",
             analysis: analyze(&frames),
         });
+        container_frames = Some(frames);
     }
 
     match load(path, frame_source::TimestampSource::MispMicrosectime) {
-        Ok(frames) => checks.push(SourceCheck {
-            label: "precision-timestamp SEI",
-            analysis: analyze(&frames),
-        }),
+        Ok(frames) => {
+            sources.push(SourceCheck {
+                label: "precision-timestamp SEI",
+                analysis: analyze(&frames),
+            });
+            sei_frames = Some(frames);
+        }
         Err(LoadError::NoTimestamps) => {
             if !is_mp4 {
                 bail!(
@@ -187,7 +291,30 @@ fn check_file(path: &Utf8PathBuf) -> Result<Vec<SourceCheck>> {
         Err(LoadError::Other(r)) => return Err(r),
     }
 
-    Ok(checks)
+    let cadence = match (container_frames, sei_frames) {
+        (Some(container), Some(sei)) => cadence_check(&container, &sei),
+        _ => None,
+    };
+
+    Ok(FileReport { sources, cadence })
+}
+
+/// Build a [`CadenceCheck`], or `None` when there is no cadence to speak of.
+fn cadence_check(container: &[LoadedFrame], sei: &[LoadedFrame]) -> Option<CadenceCheck> {
+    // Mismatched counts mean something more basic is wrong than the rate.
+    if container.len() != sei.len() || container.len() < 2 {
+        return None;
+    }
+    let sei_span_ns = span_ns(sei);
+    // A recording with no elapsed capture time has no rate to compare.
+    if sei_span_ns <= 0 {
+        return None;
+    }
+    Some(CadenceCheck {
+        container_span_ns: span_ns(container),
+        sei_span_ns,
+        mean_interval_ns: sei_span_ns / (sei.len() as i64 - 1),
+    })
 }
 
 /// Extract the raw-EBSP NAL units of one decoded (non-decoded) H.264 sample.
@@ -282,34 +409,39 @@ fn cmd_check(inputs: &[Utf8PathBuf]) -> Result<bool> {
     let mut any_broken = false;
     for path in inputs {
         match check_file(path) {
-            Ok(checks) => {
-                let broken: Vec<&SourceCheck> =
-                    checks.iter().filter(|c| c.analysis.is_broken()).collect();
-                if !broken.is_empty() {
+            Ok(report) => {
+                let mut details: Vec<String> = report
+                    .sources
+                    .iter()
+                    .filter(|c| c.analysis.is_broken())
+                    .map(|c| {
+                        format!(
+                            "{}: {} of {} samples inconsistent with bitstream POC order, up \
+                            to {:.1}ms early",
+                            c.label,
+                            c.analysis.num_inversions,
+                            c.analysis.num_frames,
+                            c.analysis.max_inversion_ms
+                        )
+                    })
+                    .collect();
+                if let Some(cadence) = report.cadence.as_ref().filter(|c| c.is_broken()) {
+                    details.push(cadence.describe());
+                }
+
+                if !details.is_empty() {
                     any_broken = true;
-                    let details = broken
-                        .iter()
-                        .map(|c| {
-                            format!(
-                                "{}: {} of {} samples inconsistent with bitstream POC order, up \
-                                to {:.1}ms early",
-                                c.label,
-                                c.analysis.num_inversions,
-                                c.analysis.num_frames,
-                                c.analysis.max_inversion_ms
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    println!("BROKEN  {path}  ({details})");
+                    println!("BROKEN  {path}  ({})", details.join("; "));
                 } else {
-                    let num_frames = checks.first().map(|c| c.analysis.num_frames).unwrap_or(0);
-                    let checked = checks
-                        .iter()
-                        .map(|c| c.label)
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    println!("OK      {path}  ({num_frames} samples; checked: {checked})");
+                    let num_frames = report.num_frames();
+                    let mut checked: Vec<&str> = report.sources.iter().map(|c| c.label).collect();
+                    if report.cadence.is_some() {
+                        checked.push("container-vs-capture rate");
+                    }
+                    println!(
+                        "OK      {path}  ({num_frames} samples; checked: {})",
+                        checked.join(", ")
+                    );
                 }
             }
             Err(e) => {
@@ -733,6 +865,95 @@ mod tests {
             analysis.num_frames,
             analysis.max_inversion_ms
         );
+    }
+
+    /// Timing series for a container and an SEI at the given nanosecond times.
+    fn series(times: &[i64]) -> Vec<LoadedFrame> {
+        times
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| frame(t, i as i64))
+            .collect()
+    }
+
+    /// A container running at exactly the capture rate must not be flagged. The
+    /// small residue here is timescale rounding, which is what the half-frame
+    /// threshold is meant to tolerate.
+    #[test]
+    fn cadence_accepts_a_container_at_the_capture_rate() {
+        let sei: Vec<i64> = (0..20).map(|i| i * 40_000_000).collect();
+        let container: Vec<i64> = sei.iter().map(|t| t + 11_000).collect();
+        let check = cadence_check(&series(&container), &series(&sei)).unwrap();
+        assert!(!check.is_broken(), "{}", check.describe());
+    }
+
+    /// The `n/(n-1)` bug: the container spans `(n-1)/n` of the capture time, so
+    /// playback is that factor too fast. `analyze` sees nothing wrong -- the
+    /// timeline is still monotonic -- which is exactly why this check exists.
+    #[test]
+    fn cadence_flags_a_uniformly_compressed_timeline() {
+        let n = 20i64;
+        let sei: Vec<i64> = (0..n).map(|i| i * 40_000_000).collect();
+        // Every duration scaled by (n-1)/n, as the old scaling did.
+        let container: Vec<i64> = (0..n).map(|i| i * 40_000_000 * (n - 1) / n).collect();
+
+        // The ordering check is blind to it.
+        assert!(!analyze(&series(&container)).is_broken());
+
+        let check = cadence_check(&series(&container), &series(&sei)).unwrap();
+        assert!(check.is_broken(), "{}", check.describe());
+        // The drift is `span / n`: one *compressed* interval, which is
+        // `(n-1)/n` of a mean interval -- 0.95 frames here, tending to a whole
+        // frame as the recording lengthens. Never far from one frame at any
+        // length, which is what makes half a frame a length-independent
+        // threshold.
+        let expected_drift = check.sei_span_ns / n;
+        assert!(
+            (check.drift_ns() - expected_drift).abs() <= expected_drift / 100,
+            "expected a drift of span/n = {expected_drift}ns, got {}",
+            check.describe()
+        );
+        assert!(check.drift_ns() * 100 > check.mean_interval_ns * 90);
+    }
+
+    /// The same bug on a long recording. The *percentage* error shrinks with
+    /// length (0.1% at n=1000) but the absolute drift stays at one frame, so a
+    /// relative threshold would have missed this and the half-frame one does not.
+    #[test]
+    fn cadence_flags_compression_on_a_long_recording() {
+        let n = 1000i64;
+        let sei: Vec<i64> = (0..n).map(|i| i * 40_000_000).collect();
+        let container: Vec<i64> = (0..n).map(|i| i * 40_000_000 * (n - 1) / n).collect();
+        let check = cadence_check(&series(&container), &series(&sei)).unwrap();
+        assert!(
+            check.rate_error().abs() < 0.002,
+            "rate error should be tiny"
+        );
+        assert!(check.is_broken(), "{}", check.describe());
+    }
+
+    /// A writer may deliberately snap presentation times to an estimated cadence,
+    /// discarding capture-timestamp jitter that the acquisition clock never had.
+    /// That moves individual frames but preserves the total, so it must not be
+    /// reported as a rate fault -- which is why this compares spans and not
+    /// frames.
+    #[test]
+    fn cadence_accepts_a_container_snapped_to_a_clean_grid() {
+        const JITTER: [i64; 10] = [
+            0, 1_300_000, -900_000, 2_000_000, -1_700_000, 600_000, -400_000, 1_100_000,
+            -2_000_000, 300_000,
+        ];
+        let n = 20usize;
+        let sei: Vec<i64> = (0..n)
+            .map(|i| i as i64 * 40_000_000 + JITTER[i % JITTER.len()])
+            .collect();
+        // Snapped to the span-derived rate, so the ends line up and the middle
+        // does not.
+        let rate = (sei[n - 1] - sei[0]) / (n as i64 - 1);
+        let container: Vec<i64> = (0..n).map(|i| i as i64 * rate).collect();
+
+        let check = cadence_check(&series(&container), &series(&sei)).unwrap();
+        assert!(!check.is_broken(), "{}", check.describe());
     }
 
     /// The multi-GOP fix must not blind the check to real corruption *within* a
