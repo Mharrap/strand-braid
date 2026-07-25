@@ -348,23 +348,32 @@ where
             return inconsistent_state_err();
         }
 
+        // `None` until the frame before this one is ready to write; emission runs
+        // one frame behind so each sample's duration can be measured against its
+        // successor. The last frame is emitted by `finish`.
         let sample = match &mut state.my_encoder {
             &mut MyEncoder::CopyRawH264 {
                 ref mut h264_parser,
-            } => h264_parser.avcc_sample().unwrap(),
+            } => h264_parser.avcc_sample(),
             _ => {
                 panic!();
             }
         };
 
-        let write_result = match &mut state.mp4_segment {
-            MaybeMp4Writer::Mp4Writer(mp4_writer) => mp4_writer
+        let write_result = match (&mut state.mp4_segment, sample) {
+            (_, None) => Ok(()),
+            (MaybeMp4Writer::Mp4Writer(mp4_writer), Some(sample)) => mp4_writer
                 .write_sample(TRACK_ID, &sample)
                 .map_err(Error::from),
             _ => {
                 return inconsistent_state_err();
             }
         };
+        if write_result.is_err()
+            && let MyEncoder::CopyRawH264 { h264_parser } = &mut state.my_encoder
+        {
+            h264_parser.note_write_failed();
+        }
         self.inner = Some(WriteState::Recording(state));
         write_result?;
 
@@ -626,13 +635,14 @@ where
                 self.inner = Some(WriteState::Finished);
                 Ok(())
             }
-            #[cfg_attr(not(feature = "nv-encode"), expect(unused_mut))]
             Some(WriteState::Recording(mut state)) => {
                 match state.my_encoder {
                     MyEncoder::CopyRawH264 { h264_parser: _ } | MyEncoder::LessH264(_) => { /* nothing to do */
                     }
+                    // Matched by reference, not moved: the encoder's parser is
+                    // still needed below to flush the final held-back frame.
                     #[cfg(feature = "openh264")]
-                    MyEncoder::OpenH264(_encoder) => { /* nothing to do */ }
+                    MyEncoder::OpenH264(_) => { /* nothing to do */ }
                     #[cfg(not(feature = "nv-encode"))]
                     MyEncoder::NoNvidia(_) => {
                         return Err(Error::NoNvencCompiledError);
@@ -664,7 +674,25 @@ where
                     }
                 }
 
+                // Emission runs one frame behind so each sample's duration can be
+                // measured against its successor, which leaves the final frame
+                // held back. Write it now -- after the nvenc drain above, which
+                // can still produce frames -- and before closing the track.
+                let final_sample = match &mut state.my_encoder {
+                    MyEncoder::CopyRawH264 { h264_parser } => h264_parser.flush_final(),
+                    MyEncoder::LessH264(wrapper) => wrapper.h264_parser.flush_final(),
+                    #[cfg(feature = "openh264")]
+                    MyEncoder::OpenH264(encoder) => encoder.h264_parser.flush_final(),
+                    #[cfg(feature = "nv-encode")]
+                    MyEncoder::Nvidia(nv_encoder) => nv_encoder.h264_parser.flush_final(),
+                    #[cfg(not(feature = "nv-encode"))]
+                    MyEncoder::NoNvidia(_) => None,
+                };
+
                 if let MaybeMp4Writer::Mp4Writer(mut mp4_writer) = state.mp4_segment {
+                    if let Some(final_sample) = final_sample {
+                        mp4_writer.write_sample(TRACK_ID, &final_sample)?;
+                    }
                     mp4_writer.write_end()?;
                 }
 
@@ -910,8 +938,16 @@ impl LessEncoderWrapper {
             }
         };
 
-        let avcc_sample = self.h264_parser.avcc_sample().unwrap();
-        mp4_writer.write_sample(TRACK_ID, &avcc_sample)?;
+        // `None` until the previous frame is ready; emission runs one frame behind
+        // so each duration can be measured against the following frame. The last
+        // frame is emitted by `Mp4Writer::finish`.
+        if let Some(avcc_sample) = self.h264_parser.avcc_sample()
+            && let Err(e) = mp4_writer.write_sample(TRACK_ID, &avcc_sample)
+        {
+            self.h264_parser.note_write_failed();
+            *mp4_segment = MaybeMp4Writer::Mp4Writer(mp4_writer);
+            return Err(e.into());
+        }
 
         *mp4_segment = MaybeMp4Writer::Mp4Writer(mp4_writer);
 
@@ -957,8 +993,16 @@ impl NvEncoder<'_> {
             }
         };
 
-        let avcc_sample = self.h264_parser.avcc_sample().unwrap();
-        mp4_writer.write_sample(TRACK_ID, &avcc_sample)?;
+        // `None` until the previous frame is ready; emission runs one frame behind
+        // so each duration can be measured against the following frame. The last
+        // frame is emitted by `Mp4Writer::finish`.
+        if let Some(avcc_sample) = self.h264_parser.avcc_sample()
+            && let Err(e) = mp4_writer.write_sample(TRACK_ID, &avcc_sample)
+        {
+            self.h264_parser.note_write_failed();
+            *mp4_segment = MaybeMp4Writer::Mp4Writer(mp4_writer);
+            return Err(e.into());
+        }
 
         *mp4_segment = MaybeMp4Writer::Mp4Writer(mp4_writer);
 
@@ -1043,8 +1087,16 @@ impl OpenH264Encoder {
             }
         };
 
-        let avcc_sample = self.h264_parser.avcc_sample().unwrap();
-        mp4_writer.write_sample(TRACK_ID, &avcc_sample)?;
+        // `None` until the previous frame is ready; emission runs one frame behind
+        // so each duration can be measured against the following frame. The last
+        // frame is emitted by `Mp4Writer::finish`.
+        if let Some(avcc_sample) = self.h264_parser.avcc_sample()
+            && let Err(e) = mp4_writer.write_sample(TRACK_ID, &avcc_sample)
+        {
+            self.h264_parser.note_write_failed();
+            *mp4_segment = MaybeMp4Writer::Mp4Writer(mp4_writer);
+            return Err(e.into());
+        }
 
         *mp4_segment = MaybeMp4Writer::Mp4Writer(mp4_writer);
 
@@ -1070,10 +1122,22 @@ where
 struct H264Parser {
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
-    previous_stamp: Option<u64>,
+    /// Most recently parsed frame, awaiting the *next* frame's presentation time
+    /// so its duration can be measured. See [`H264Parser::avcc_sample`].
+    pending: Option<ParsedH264Frame>,
+    /// The last duration derived from a pair of frames, used to extrapolate the
+    /// final frame's duration, which has no successor to measure against.
+    last_derived_duration: Option<u64>,
     /// stores MP4 sample until written
     last_sample: Option<ParsedH264Frame>,
     first_frame_done: bool,
+    /// Set when writing a sample failed. No further sample may be handed to the
+    /// track after that: `mp4::Mp4TrackWriter::write_sample` is not atomic --  it
+    /// counts the sample before the IO that failed and only advances `sample_id`
+    /// afterwards -- so its `chunk_samples` and `sample_id` are left inconsistent
+    /// and the *next* write panics computing `sample_id - chunk_samples + 1`.
+    /// Finishing the file is still fine; only adding to it is not.
+    write_failed: bool,
     h264_metadata: Option<H264Metadata>,
 }
 
@@ -1083,11 +1147,18 @@ impl H264Parser {
         Self {
             sps: None,
             pps: None,
-            previous_stamp: None,
+            pending: None,
+            last_derived_duration: None,
             last_sample: None,
             first_frame_done: false,
+            write_failed: false,
             h264_metadata,
         }
+    }
+    /// Record that a sample write failed, so no further sample is handed to the
+    /// track. See [`H264Parser::write_failed`].
+    fn note_write_failed(&mut self) {
+        self.write_failed = true;
     }
     fn sps(&self) -> Option<&[u8]> {
         self.sps.as_deref()
@@ -1209,35 +1280,75 @@ impl H264Parser {
         };
     }
 
+    /// Take the next MP4 sample that is ready to be written, if any.
+    ///
+    /// A sample's duration is the interval to the frame *after* it, so emission
+    /// runs one frame behind the parser: the frame just pushed is held in
+    /// `pending` and only becomes writable once its successor arrives. This
+    /// returns `None` for the first frame of a recording for that reason.
+    /// [`Self::flush_final`] emits the frame still held at the end.
+    ///
+    /// Deriving the duration from the *preceding* frame instead, as this used to,
+    /// gave the first sample a duration of 0 and every later sample the interval
+    /// that came before it -- so the first two samples shared a presentation
+    /// time, every frame was presented one interval early, and the track came out
+    /// one interval short.
     fn avcc_sample(&mut self) -> Option<mp4::Mp4Sample> {
-        let explicit_duration = self.last_sample.as_ref().and_then(|f| f.explicit_duration);
-        let mut sample = self.last_sample.take().map(parsed_to_mp4_sample);
+        let incoming = self.last_sample.take();
+        let next_start = incoming.as_ref().map(|f| f.mp4_sample_start_time);
+        let ready = std::mem::replace(&mut self.pending, incoming);
+
+        let explicit_duration = ready.as_ref().and_then(|f| f.explicit_duration);
+        let mut sample = ready.map(parsed_to_mp4_sample);
         if let Some(ref mut s) = sample {
             match explicit_duration {
                 // Timing passed through from a source file: use the sample's own
-                // duration (stts) directly. The composition offset (ctts) is
-                // already set on the sample, so reordered streams stay correct.
+                // duration (stts) directly, nothing to measure. The composition
+                // offset (ctts) is already set on the sample, so reordered streams
+                // stay correct. Emission still runs one frame behind, so samples
+                // reach the writer in the same order either way.
                 Some(dur) => {
                     s.duration = dur.try_into().unwrap();
                 }
-                // Otherwise derive the duration from the delta between
-                // consecutive presentation times. This requires monotonic
-                // start_times and cannot represent reordered streams.
+                // Otherwise measure the interval to the frame that follows.
                 None => {
-                    if let Some(prev) = self.previous_stamp {
-                        // FIXME: This will be off by one frame because it calculates duration
-                        // of this frame as delta between previous frame and this frame. (It
-                        // should be delta between this frame and next frame.)
-                        let dur = s.start_time - prev;
+                    if let Some(next_start) = next_start {
+                        let dur = next_start.saturating_sub(s.start_time);
                         s.duration = dur.try_into().unwrap();
+                        self.last_derived_duration = Some(s.duration as u64);
                     }
-                    self.previous_stamp = Some(s.start_time);
                 }
             }
         }
         // Note: as far as I can tell, as of version 0.13.0, the mp4 crate does not
         // use `start_time` for writing the sample. (So we have gone to the trouble
         // of ensuring it has a good PTS value but it is ignored.)
+        sample
+    }
+
+    /// Emit the frame still held back by [`Self::avcc_sample`]'s one-frame delay.
+    ///
+    /// Its duration cannot be measured -- there is no following frame to measure
+    /// against -- so the most recent interval is reused as the best available
+    /// estimate. A single-frame recording has no interval at all and falls back
+    /// to zero.
+    ///
+    /// Yields nothing once a sample write has failed: the track cannot take
+    /// another sample then, and dropping one frame is the right trade for still
+    /// being able to close the file.
+    fn flush_final(&mut self) -> Option<mp4::Mp4Sample> {
+        if self.write_failed {
+            return None;
+        }
+        let ready = self.pending.take();
+        let explicit_duration = ready.as_ref().and_then(|f| f.explicit_duration);
+        let mut sample = ready.map(parsed_to_mp4_sample);
+        if let Some(ref mut s) = sample {
+            s.duration = match explicit_duration {
+                Some(dur) => dur.try_into().unwrap(),
+                None => self.last_derived_duration.unwrap_or(0).try_into().unwrap(),
+            };
+        }
         sample
     }
 }
@@ -1618,12 +1729,26 @@ mod tests {
             .unwrap_err();
         assert!(write_error.to_string().contains("injected write failure"));
 
+        // The point of the test: the failed sample write must not stop the file
+        // from being closed out and read back.
         writer.finish().unwrap();
         drop(writer);
 
         let output = output_cursor.borrow().get_ref().clone();
         let output_len = output.len() as u64;
         let reader = mp4::Mp4Reader::read_header(Cursor::new(output), output_len).unwrap();
-        assert_eq!(reader.sample_count(super::TRACK_ID).unwrap(), 2);
+
+        // One sample, not two, and both frames are accounted for.
+        //
+        // Sample durations are measured against the *following* frame, so
+        // emission runs one frame behind: the first `write_h264_buf` queued frame
+        // one without writing it, and the second call is what tried to write it
+        // -- that is the write the injected failure hit. Frame two was still held
+        // back at `finish`, and is dropped rather than written, because
+        // `mp4::Mp4TrackWriter::write_sample` cannot take another sample after
+        // one has failed (see `H264Parser::write_failed`). Losing the last frame
+        // of a recording that already hit a write error is the right trade for
+        // still producing a readable file.
+        assert_eq!(reader.sample_count(super::TRACK_ID).unwrap(), 1);
     }
 }
