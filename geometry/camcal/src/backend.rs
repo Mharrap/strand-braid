@@ -43,10 +43,8 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Convert an interleaved RGB buffer to grayscale. The buffer is interpreted as
-/// BGR and reduced as OpenCV's `COLOR_BGR2GRAY` would, so that color inputs are
-/// handled identically to historical behavior. For grayscale inputs (R == G ==
-/// B) this is the identity.
+/// Convert an interleaved RGB buffer to grayscale with BT.601 coefficients.
+/// For grayscale inputs (R == G == B) this is the identity.
 fn rgb_to_gray(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
     let n = (width as usize) * (height as usize);
     let mut gray = vec![0u8; n];
@@ -54,10 +52,9 @@ fn rgb_to_gray(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
         let r = rgb[3 * i] as i32;
         let g = rgb[3 * i + 1] as i32;
         let b = rgb[3 * i + 2] as i32;
-        // OpenCV BGR2GRAY fixed point (yuv_shift = 14): Y = R*4899 + G*9617 +
-        // B*1868, with the buffer read as B,G,R — i.e. our byte0 is OpenCV's B
-        // and our byte2 is OpenCV's R.
-        gray[i] = ((b * 4899 + g * 9617 + r * 1868 + 8192) >> 14) as u8;
+        // OpenCV RGB2GRAY fixed point (yuv_shift = 14): Y = R*4899 + G*9617 +
+        // B*1868.
+        gray[i] = ((r * 4899 + g * 9617 + b * 1868 + 8192) >> 14) as u8;
     }
     gray
 }
@@ -118,4 +115,16 @@ pub fn calibrate_camera(
         image_width: res.image_width,
         image_height: res.image_height,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rgb_to_gray;
+
+    #[test]
+    fn rgb_to_gray_uses_rgb_channel_order() {
+        let gray = rgb_to_gray(&[255, 0, 0, 0, 255, 0, 0, 0, 255], 3, 1);
+
+        assert_eq!(gray, [76, 150, 29]);
+    }
 }
