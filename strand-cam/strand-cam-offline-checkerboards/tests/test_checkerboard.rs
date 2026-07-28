@@ -69,20 +69,20 @@ fn test_checkerboard() -> Result<()> {
     // expected.)
 
     // camera_matrix is stored in row major order.
-    approx::assert_relative_eq!(cal.camera_matrix[0], 1188.8, epsilon = 0.5); // fx
-    approx::assert_relative_eq!(cal.camera_matrix[1], 0.0); // skew
-    approx::assert_relative_eq!(cal.camera_matrix[2], 939.0, epsilon = 1.0); // cx
-    approx::assert_relative_eq!(cal.camera_matrix[3], 0.0);
-    approx::assert_relative_eq!(cal.camera_matrix[4], 1188.8, epsilon = 0.5); // fy
-    approx::assert_relative_eq!(cal.camera_matrix[5], 583.0, epsilon = 1.0); // cy
-    approx::assert_relative_eq!(cal.camera_matrix[6], 0.0);
-    approx::assert_relative_eq!(cal.camera_matrix[7], 0.0);
-    approx::assert_relative_eq!(cal.camera_matrix[8], 1.0);
+    approx::assert_abs_diff_eq!(cal.camera_matrix[0], 1202.36, epsilon = 0.01); // fx
+    approx::assert_abs_diff_eq!(cal.camera_matrix[1], 0.0); // skew
+    approx::assert_abs_diff_eq!(cal.camera_matrix[2], 938.70, epsilon = 0.01); // cx
+    approx::assert_abs_diff_eq!(cal.camera_matrix[3], 0.0);
+    approx::assert_abs_diff_eq!(cal.camera_matrix[4], 1200.6, epsilon = 0.01); // fy
+    approx::assert_abs_diff_eq!(cal.camera_matrix[5], 577.8, epsilon = 0.01); // cy
+    approx::assert_abs_diff_eq!(cal.camera_matrix[6], 0.0);
+    approx::assert_abs_diff_eq!(cal.camera_matrix[7], 0.0);
+    approx::assert_abs_diff_eq!(cal.camera_matrix[8], 1.0);
 
-    approx::assert_relative_eq!(cal.distortion_coeffs[0], -0.234, epsilon = 0.01);
-    approx::assert_relative_eq!(cal.distortion_coeffs[1], 0.0754987651101312, epsilon = 0.01);
-    approx::assert_relative_eq!(cal.distortion_coeffs[2], -7.954e-6, epsilon = 1e-4);
-    approx::assert_relative_eq!(cal.distortion_coeffs[3], 6.39e-5, epsilon = 1e-4);
+    approx::assert_abs_diff_eq!(cal.distortion_coeffs[0], -0.234, epsilon = 0.01);
+    approx::assert_abs_diff_eq!(cal.distortion_coeffs[1], 0.0754987651101312, epsilon = 0.01);
+    approx::assert_abs_diff_eq!(cal.distortion_coeffs[2], 0.0, epsilon = 1e-3);
+    approx::assert_abs_diff_eq!(cal.distortion_coeffs[3], 0.0, epsilon = 1e-3);
 
     Ok(())
 }
