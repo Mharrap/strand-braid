@@ -30,23 +30,48 @@
 //! owns both locally and hands decoded frames across a small bounded
 //! channel, giving the usual producer/consumer backpressure.
 //!
-//! # Pacing
+//! # Starting and stopping playback
+//!
+//! Three independent controls govern when frames actually move, from most
+//! to least generic:
+//!
+//! - [`ci2::Camera::acquisition_start`]/[`ci2::Camera::acquisition_stop`],
+//!   the same trait methods every `ci2` backend implements: `start` resets
+//!   the frame counter and pacing origin to "now"; `stop` clears the pacing
+//!   origin entirely, so a subsequent [`ci2::Camera::next_frame`] call (if
+//!   any) returns frames completely unpaced until `start` is called again.
+//! - [`VIDEO_FILE_AUTOSTART_ENV`], which delays the *first* frame from ever
+//!   advancing until told to -- see "Holding on the first frame" below.
+//! - [`VIDEO_FILE_LOOP_ENV`], which governs what happens once the *last*
+//!   frame is reached -- see "Playing once, then holding on the last frame"
+//!   below.
+//!
+//! # Pacing (frame rate control)
 //!
 //! Frames are paced to the source's native frame rate -- from
 //! [`frame_source::FrameDataSource::average_framerate`] when available (only
 //! for a video recorded by strand-cam itself; see [`DecodedFrame`]'s docs),
 //! else estimated from two real consecutive frames' own timestamps, else
-//! [`DEFAULT_FPS`] -- using the same `Instant`-based sleep-until-target
-//! idiom `ci2-sim` uses (with a resync guard so a delayed caller doesn't
-//! trigger a burst of frames to "catch up"), and can be overridden the same
-//! way (`acquisition_frame_rate_enable`/`set_acquisition_frame_rate`), or by
-//! setting [`VIDEO_FILE_LIMIT_FRAMERATE_ENV`] at open time (e.g. because a
-//! downstream processing pipeline -- checkerboard detection, ... -- can't
-//! keep up with the source's native rate on a given machine). Either way
-//! this only changes how fast frames are served: every decoded frame is
-//! still served, in the same order, so a lower rate plays back in slow
-//! motion rather than skipping frames, and holding on the first/last frame
-//! (see below) is unaffected.
+//! [`DEFAULT_FPS`]. That rate can be overridden two ways: at runtime via the
+//! normal `ci2::Camera` GenICam-style accessors
+//! (`acquisition_frame_rate_enable`/`set_acquisition_frame_rate_enable` to
+//! toggle pacing on/off, `acquisition_frame_rate`/`set_acquisition_frame_rate`
+//! to get/set the rate directly), or at open time via
+//! [`VIDEO_FILE_LIMIT_FRAMERATE_ENV`] (e.g. because a downstream processing
+//! pipeline -- checkerboard detection, ... -- can't keep up with the
+//! source's native rate on a given machine). Either way this only changes
+//! how fast frames are served: every decoded frame is still served, in the
+//! same order, so a lower rate plays back in slow motion rather than
+//! skipping frames, and holding on the first/last frame (see below) is
+//! unaffected.
+//!
+//! Enforcement is an `Instant`-based absolute schedule (`target = start +
+//! frame_period * frame_number`), the same idiom `ci2-sim` uses:
+//! [`ci2::Camera::next_frame`] sleeps until `target`, but if the caller
+//! falls more than one frame period behind (e.g. a downstream stall), it
+//! resyncs the schedule to "now" instead of bursting through the backlog to
+//! catch up -- mirroring how a real camera's small hardware buffer would
+//! just drop late frames rather than deliver them all at once later.
 //!
 //! # Pixel formats
 //!
@@ -768,11 +793,19 @@ impl ci2::Camera for WrappedCamera {
         Err(ci2::Error::FeatureNotPresent())
     }
 
+    /// Resets the frame counter and the pacing origin to "now" -- pacing
+    /// (see the module-level "Pacing" docs) schedules every subsequent frame
+    /// relative to this moment, not whenever the camera was originally
+    /// opened.
     fn acquisition_start(&mut self) -> ci2::Result<()> {
         self.next_fno = 0;
         self.start = Some(Instant::now());
         Ok(())
     }
+    /// Clears the pacing origin. A subsequent [`ci2::Camera::next_frame`]
+    /// call (if any) still returns frames, but completely unpaced -- as fast
+    /// as the decoder can supply them -- until `acquisition_start` is called
+    /// again.
     fn acquisition_stop(&mut self) -> ci2::Result<()> {
         self.start = None;
         Ok(())
